@@ -25,18 +25,18 @@ Specialist agents (Text2SQL, QA RAG, Transaction Parser) are designed behind an 
 
 ```text
 ┌─────────────────────────────────────┐
-│  THIS REPO                           │
+│  THIS REPO                          │
 │  • Orchestrator (routing + wiring)  │
 │  • Guardian (safety layer)          │
 │  • Executors (post-guardian action) │
-│  • Frontend (demo UI)              │
-│  • AgentClient mocks               │
+│  • Frontend (demo UI)               │
+│  • AgentClient mocks                │
 └─────────────────────────────────────┘
          │
          │ Interface call (hackathon: local, production: HTTP/gRPC)
          ▼
 ┌─────────────────────────────────────┐
-│  SEPARATE REPOS (production)         │
+│  SEPARATE REPOS (production)        │
 │  • Transaction Agent Service        │
 │  • Text2SQL Agent Service           │
 │  • QA/RAG Agent Service             │
@@ -49,89 +49,89 @@ Specialist agents (Text2SQL, QA RAG, Transaction Parser) are designed behind an 
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
-│                         FRONTEND (Streamlit)                      │
-│  • Chat UI + risk badges (🟢🟡🟠🔴)                              │
-│  • Bank confirmation modal (GREEN)                               │
-│  • OTP step-up modal (YELLOW)                                    │
-│  • Scam alert modal (RED)                                        │
-│  • Audit trail viewer (expandable per message)                   │
+│                         FRONTEND (Streamlit)                    │
+│  • Chat UI + risk badges (🟢🟡🟠🔴)                             │
+│  • Bank confirmation modal (GREEN)                              │
+│  • OTP step-up modal (YELLOW)                                   │
+│  • Scam alert modal (RED)                                       │
+│  • Audit trail viewer (expandable per message)                  │
 └──────────────────────────────┬──────────────────────────────────┘
                                │ HTTP
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    GATEWAY (FastAPI) — THIS REPO                  │
-│                                                                   │
+│                    GATEWAY (FastAPI) — THIS REPO                │
+│                                                                 │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ ORCHESTRATOR                                               │  │
+│  │ ORCHESTRATOR                                              │  │
 │  │ • Intent classification (1 LLM call)                      │  │
 │  │ • Route to AgentClient (via interface)                    │  │
 │  │ • Pass agent output → Guardian                            │  │
 │  │ • If Guardian approves → Executor                         │  │
 │  │ • Compile response → Frontend                             │  │
 │  └───────────────────────────┬───────────────────────────────┘  │
-│                              │                                    │
+│                              │                                  │
 │  ┌───────────────────────────▼───────────────────────────────┐  │
-│  │ AGENT CLIENTS (interface + mock implementations)           │  │
-│  │                                                            │  │
+│  │ AGENT CLIENTS (interface + mock implementations)          │  │
+│  │                                                           │  │
 │  │ Interface: prepare(input, context) → AgentOutput          │  │
-│  │                                                            │  │
-│  │ • TransactionAgentClient  → mock: LLM parse NL→payload   │  │
-│  │ • Text2SQLAgentClient     → mock: LLM NL→SQL + explain   │  │
+│  │                                                           │  │
+│  │ • TransactionAgentClient  → mock: LLM parse NL→payload    │  │
+│  │ • Text2SQLAgentClient     → mock: LLM NL→SQL + explain    │  │
 │  │ • QAAgentClient           → mock: keyword search policies │  │
-│  │                                                            │  │
+│  │                                                           │  │
 │  │ ⚠️  Agents ONLY prepare. Never execute. Never call APIs.  │  │
 │  │ ⚠️  Transaction-critical fields NEVER auto-guessed.       │  │
 │  └───────────────────────────┬───────────────────────────────┘  │
-│                              │                                    │
+│                              │                                  │
 │  ┌───────────────────────────▼───────────────────────────────┐  │
-│  │ GUARDIAN                                                    │  │
-│  │                                                            │  │
-│  │ Layer 1: HARD RULES (deterministic, instant decision)      │  │
+│  │ GUARDIAN                                                  │  │
+│  │                                                           │  │
+│  │ Layer 1: HARD RULES (deterministic, instant decision)     │  │
 │  │   • Recipient in reported_accounts → RED                  │  │
 │  │   • Amount > daily_limit → BLOCK                          │  │
 │  │   • Pressure/threat keywords → ORANGE minimum             │  │
 │  │   • SQL contains DML/DDL → REJECT                         │  │
 │  │   • Consent scope violated → BLOCK                        │  │
 │  │   → If triggered: SKIP Layer 2, go to decision            │  │
-│  │                                                            │  │
-│  │ Layer 2: MODEL-BASED (only if no hard rule triggered)      │  │
+│  │                                                           │  │
+│  │ Layer 2: MODEL-BASED (only if no hard rule triggered)     │  │
 │  │   • Anomaly Detector (amount/recipient/urgency/time)      │  │
 │  │   • Scam Pattern Matcher (rules + LLM advisory)           │  │
 │  │   • SQL Validator (AST + allowlist + scope + LIMIT)       │  │
 │  │   • QA Validator (citation? confidence? version?)         │  │
-│  │                                                            │  │
+│  │                                                           │  │
 │  │ Risk Scorer: weighted(anomaly×0.35, scam×0.35,            │  │
-│  │              amount×0.15, recipient×0.15) → tier           │  │
-│  │                                                            │  │
+│  │              amount×0.15, recipient×0.15) → tier          │  │
+│  │                                                           │  │
 │  │ Friction Router: tier → auth requirement                  │  │
-│  │   GREEN(0–0.3)  → bank-native confirm                    │  │
-│  │   YELLOW(0.3–0.6) → warn + OTP/PIN                       │  │
+│  │   GREEN(0–0.3)  → bank-native confirm                     │  │
+│  │   YELLOW(0.3–0.6) → warn + OTP/PIN                        │  │
 │  │   ORANGE(0.6–0.8) → challenge + cooldown + OTP            │  │
-│  │   RED(0.8–1.0) → hard block, no bypass                   │  │
+│  │   RED(0.8–1.0) → hard block, no bypass                    │  │
 │  └───────────────────────────┬───────────────────────────────┘  │
-│                              │                                    │
+│                              │                                  │
 │  ┌───────────────────────────▼───────────────────────────────┐  │
-│  │ EXECUTORS (post-guardian, separate from agents)            │  │
-│  │                                                            │  │
+│  │ EXECUTORS (post-guardian, separate from agents)           │  │
+│  │                                                           │  │
 │  │ • TransactionExecutor → call bank API (mock in hackathon) │  │
 │  │ • SQLExecutor → run parameterized read-only query         │  │
 │  │ • QAResponseExecutor → return grounded answer             │  │
-│  │                                                            │  │
+│  │                                                           │  │
 │  │ ⚠️  Executors ONLY run after Guardian approves.           │  │
-│  │ ⚠️  Idempotency key prevents double-execution.           │  │
-│  │ ⚠️  SQLExecutor injects user_id from auth context,       │  │
+│  │ ⚠️  Idempotency key prevents double-execution.            │  │
+│  │ ⚠️  SQLExecutor injects user_id from auth context,        │  │
 │  │     NEVER trusts user_id from LLM-generated SQL.          │  │
 │  └───────────────────────────┬───────────────────────────────┘  │
-│                              │                                    │
+│                              │                                  │
 │  ┌───────────────────────────▼───────────────────────────────┐  │
-│  │ AUDIT (append-only)                                        │  │
+│  │ AUDIT (append-only)                                       │  │
 │  │ • Immutable JSON log per request                          │  │
 │  │ • Schema defined upfront (see models.py)                  │  │
 │  │ • No edit, no delete                                      │  │
 │  └───────────────────────────────────────────────────────────┘  │
-│                                                                   │
+│                                                                 │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ DATA (mock)                                                │  │
+│  │ DATA (mock)                                               │  │
 │  │ • users.json (profiles + behavioral baselines)            │  │
 │  │ • reported_accounts.json (scam registry)                  │  │
 │  │ • scam_patterns.json (known patterns)                     │  │
@@ -515,30 +515,30 @@ User: "How much did I spend on food this month?"
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              CLIENT APPS                                          │
+│                              CLIENT APPS                                        │
 │  Mobile Banking │ Web Banking │ Internal CRM                                    │
 └──────────────────────────────┬──────────────────────────────────────────────────┘
                                │ HTTPS + JWT
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                         API GATEWAY (Kong / Envoy)                                │
-│  • Rate limiting • JWT validation • Request routing                              │
+│                         API GATEWAY (Kong / Envoy)                              |
+│  • Rate limiting • JWT validation • Request routing                             │
 └──────────────────────────────┬──────────────────────────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│           TRUSTFLOW ORCHESTRATOR SERVICE (this repo, evolved)                     │
-│                                                                                   │
-│  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────────┐    │
-│  │ Orchestrator        │  │ Guardian Service    │  │ Executor Service       │    │
-│  │ • Intent classify  │→│ • Hard Rules (DB)  │→│ • TransactionExecutor  │    │
-│  │ • Task decompose   │  │ • Anomaly (ML)     │  │ • SQLExecutor          │    │
-│  │ • Multi-intent     │  │ • Scam (classifier)│  │ • Payment Gateway call │    │
-│  │ • Agent routing    │  │ • Risk Scorer      │  │ • Idempotency enforced │    │
-│  └────────────────────┘  └────────────────────┘  └────────────────────────┘    │
-│                                                                                   │
+│           TRUSTFLOW ORCHESTRATOR SERVICE (this repo, evolved)                   │
+│                                                                                 │
+│  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────────┐     │
+│  │ Orchestrator       │  │ Guardian Service   │  │ Executor Service       │     │
+│  │ • Intent classify  │→ │ • Hard Rules (DB)  │→ │ • TransactionExecutor  │     │
+│  │ • Task decompose   │  │ • Anomaly (ML)     │  │ • SQLExecutor          │     │
+│  │ • Multi-intent     │  │ • Scam (classifier)│  │ • Payment Gateway call │     │
+│  │ • Agent routing    │  │ • Risk Scorer      │  │ • Idempotency enforced │     │
+│  └────────────────────┘  └────────────────────┘  └────────────────────────┘     │
+│                                                                                 │
 │  ┌────────────────────┐  ┌────────────────────┐                                 │
-│  │ Session (Redis)     │  │ Audit (Kafka)      │                                 │
+│  │ Session (Redis)    │  │ Audit (Kafka)      │                                 │
 │  │ • History          │  │ • Immutable events │                                 │
 │  │ • Cooldown timers  │  │ • Structured schema│                                 │
 │  └────────────────────┘  └────────────────────┘                                 │
@@ -547,30 +547,30 @@ User: "How much did I spend on food this month?"
           ┌────────────────────┼────────────────────┐
           ▼                    ▼                    ▼
 ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-│ TRANSACTION      │ │ TEXT2SQL          │ │ QA/RAG           │
+│ TRANSACTION      │ │ TEXT2SQL         │ │ QA/RAG           │
 │ AGENT SERVICE    │ │ AGENT SERVICE    │ │ AGENT SERVICE    │
 │ (separate repo)  │ │ (separate repo)  │ │ (separate repo)  │
 │                  │ │                  │ │                  │
-│ • NL → payload  │ │ • NL → SQL       │ │ • Query → answer │
-│ • Field valid.  │ │ • Schema-aware   │ │ • Vector search  │
-│ • Beneficiary   │ │ • Multi-dialect  │ │ • Citation+ver.  │
-│   validation    │ │                  │ │                  │
+│ • NL → payload   │ │ • NL → SQL       │ │ • Query → answer │
+│ • Field valid.   │ │ • Schema-aware   │ │ • Vector search  │
+│ • Beneficiary    │ │ • Multi-dialect  │ │ • Citation+ver.  │
+│   validation     │ │                  │ │                  │
 │                  │ │                  │ │                  │
-│ ⚠️ NO Bank API  │ │ ⚠️ NO execution  │ │ ⚠️ Prepare only  │
-│   call here     │ │   of SQL here    │ │                  │
+│ ⚠️ NO Bank API   │ │ ⚠️ NO execution  │ │ ⚠️ Prepare only  │
+│   call here      │ │   of SQL here    │ │                  │
 └──────────────────┘ └──────────────────┘ └──────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           SHARED INFRASTRUCTURE                                   │
-│                                                                                   │
-│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  ┌──────────────┐  │
-│  │ PostgreSQL      │  │ Kafka          │  │ Elasticsearch  │  │ Prometheus   │  │
-│  │ • User profiles│  │ • Audit events │  │ • Audit search │  │ + Grafana    │  │
-│  │ • Rules config │  │ • Agent events │  │ • Log search   │  │ • Metrics    │  │
-│  │ • Scam registry│  │ • Alerts       │  │                │  │ • Alerting   │  │
-│  └────────────────┘  └────────────────┘  └────────────────┘  └──────────────┘  │
-│                                                                                   │
+│                           SHARED INFRASTRUCTURE                                 │
+│                                                                                 │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  ┌──────────────┐   │
+│  │ PostgreSQL     │  │ Kafka          │  │ Elasticsearch  │  │ Prometheus   │   │
+│  │ • User profiles│  │ • Audit events │  │ • Audit search │  │ + Grafana    │   │
+│  │ • Rules config │  │ • Agent events │  │ • Log search   │  │ • Metrics    │   │
+│  │ • Scam registry│  │ • Alerts       │  │                │  │ • Alerting   │   │
+│  └────────────────┘  └────────────────┘  └────────────────┘  └──────────────┘   │
+│                                                                                 │
 │  ┌────────────────┐  ┌────────────────┐                                         │
 │  │ Bank IAM       │  │ Vault/KMS      │                                         │
 │  │ • OTP service  │  │ • API keys     │                                         │
