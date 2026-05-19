@@ -4,7 +4,8 @@ import logging
 
 from backend.config import OPENAI_API_KEY, OPENAI_MODEL
 from backend.models import ChatRequest, ChatResponse, IntentResult
-from backend.prompts.intent import INTENT_SYSTEM_PROMPT, INTENT_USER_TEMPLATE
+from backend.agents.transaction import transaction_agent
+from backend.prompts import INTENT_SYSTEM_PROMPT, INTENT_USER_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +43,24 @@ class Orchestrator:
     async def handle_chat(self, request: ChatRequest) -> ChatResponse:
         logger.info(f"Chat request from user={request.user_id}, session={request.session_id}")
         intent = await self.classify_intent(request.message)
+        
+        if intent.route == "transaction_extractor":
+            agent_output = await transaction_agent.extract(request.message)
+            
+            if agent_output.clarification:
+                return ChatResponse(
+                    status="clarification_needed",
+                    response=agent_output.clarification,
+                )
+            return ChatResponse(
+                status="completed",
+                response=f"[Agent] action={agent_output.action}, "
+                f"detail={json.dumps(agent_output.detail, ensure_ascii=False)}, "
+                f"risk_signals={agent_output.risk_signals}",
+            )
         return ChatResponse(
             status="completed",
-            response=f"[Router] task_type={intent.task_type}, risk={intent.risk_hint}, "
-            f"route={intent.route}, confidence={intent.confidence}, reason={intent.reason}",
+            response=f"[Router] task_type={intent.task_type}, route={intent.route} (not implemented yet)",
         )
 
 

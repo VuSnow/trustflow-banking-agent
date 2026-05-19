@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Literal, Any
 import uuid
 
 
@@ -27,3 +27,30 @@ class IntentResult(BaseModel):
     route: str = ""       # qa_handler | data_query_extractor | transaction_extractor
     confidence: float = 0.0
     reason: str = ""
+
+
+class AgentOutput(BaseModel):
+    agent_type: str  
+    action: str 
+    detail: dict = {}  
+    # ["large_amount", "unknown_recipient", ...]
+    risk_signals: list[str] = Field(default_factory=list)
+    clarification: Optional[str] = None 
+    raw_message: str = ""  
+
+class TransactionExtractionResult(BaseModel):
+    transaction_type: Literal[
+        "transfer",
+        "bill_payment",
+        "top_up",
+        "card_lock",
+        "card_unlock",
+        "account_opening",
+        "loan_application",
+        "unknown",
+    ]
+    details: dict[str, Any]
+    raw_text: str
+    needs_clarification: bool = False
+    missing_info: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)

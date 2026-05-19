@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.models import ChatRequest, ChatResponse
-from backend.orchestrator import orchestrator
+from backend.agents.orchestrator import orchestrator
 import logging
 
 logging.basicConfig(
