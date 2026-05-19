@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from backend.models import ChatRequest, ChatResponse
+from backend.models import ChatRequest
+from backend.agents import orchestrator
 import logging
 
 logging.basicConfig(
@@ -23,7 +24,8 @@ app.add_middleware(
 async def health():
     return {"status": "OK"}
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    logger.info(f"ChatRequest receive: {request}")
-    return
+    logger.info(f"[RECEIVED] user={request.user_id} msg={request.message}")
+    intent = await orchestrator.classify_intent(request.message)
+    return {"status": "classified", "data": intent.model_dump()}
