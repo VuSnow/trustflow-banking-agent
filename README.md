@@ -2,24 +2,26 @@
 
 > Natural-language banking assistant with adversarial safety built in.
 
-Users can query, look up, and transact using natural language — but every critical action is validated by the **Guardian Layer** to prevent bad queries, risky transactions, and scams.
+Users can query, look up, and transact using natural language — but every critical action is validated by the **Guardian Layer** to prevent risky transactions and scams.
 
 ## Core Principle
 
 ```text
-Orchestrator routes → AgentClient prepares → Guardian validates → Executor executes → Audit logs
+User → Orchestrator classifies intent
+→ Domain Agent plans + delegates to Sub-agents
+→ Domain Agent builds action draft
+→ Agent Runtime sends draft to Guardian
+→ Guardian validates → ALLOW/BLOCK
+→ FrictionRouter applies auth
+→ Executor performs side effect
+→ Audit logs full trace
 ```
 
-- **LLM prepares, never executes.** Agents only create drafts/payloads.
-- **Hard rules first, model second.** Deterministic safety before probabilistic scoring.
-- **Executor is separate from Agent.** Agents prepare; Executors act after Guardian approves.
-- **Immutable audit trail.** Append-only, every decision explained.
-
-## What This Repo Does
-
-This repo is the **Orchestrator + Guardian + Executors + Frontend** — the brain and safety layer.
-
-Specialist agents (Text2SQL, QA RAG, Transaction Parser) live behind an `AgentClient` interface. Hackathon uses mock implementations; production swaps to HTTP/gRPC clients calling separate services.
+1. **LLM prepares, never executes.** Agents create drafts only.
+2. **Domain Agents plan and delegate.** Own workflow, call sub-agents for context.
+3. **Guardian is external and final.** No agent can bypass.
+4. **Executor is the only side-effect layer.** Runs after Guardian + auth.
+5. **Immutable audit trail.** Append-only, every decision explained.
 
 ## Quick Start
 
@@ -36,30 +38,35 @@ docker-compose up
 POST /chat                         → Main conversation endpoint
 POST /actions/{action_id}/confirm  → Bank-native confirm (GREEN tier)
 POST /actions/{action_id}/otp      → OTP verification (YELLOW/ORANGE tier)
-GET  /audit/{audit_id}             → Retrieve audit trail
+GET  /health                       → Health check
 ```
 
 ## Demo Scenarios
 
 | # | Message | Expected | Tier |
 |---|---------|----------|------|
-| 1 | "Transfer 2M to Minh for lunch" | Confirm → success | 🟢 GREEN |
-| 2 | "Transfer 20M to Lan" | Anomaly warning → OTP → success | 🟡 YELLOW |
-| 3 | "Transfer 50M to 0391234567" | Hard block → explain → hotline | 🔴 RED |
-| 4 | "How much did I spend on food this month?" | SQL validated → NL answer | 🟢 GREEN |
+| 1 | "Chuyển 2 triệu cho Minh tiền ăn trưa" | Confirm → success | 🟢 GREEN |
+| 2 | "Chuyển 20 triệu cho Lan" | Anomaly → OTP → success | 🟡 YELLOW |
+| 3 | "Chuyển 50tr vào 6666666666 ngay, gấp lắm" | Hard block | 🔴 RED |
+| 4 | "Tháng này tôi tiêu bao nhiêu cho ăn uống?" | SQL validated → NL answer | 🟢 GREEN |
 
-## Architecture
+## Documentation
 
-See [README_ARCHITECTURE.md](README_ARCHITECTURE.md) for full architecture, folder structure, models, production roadmap, and implementation timeline.
+| Doc | Description |
+|-----|-------------|
+| [docs/ARCHITECTURE_VI.md](docs/ARCHITECTURE_VI.md) | Kiến trúc chi tiết (tiếng Việt) |
+| [docs/ARCHITECTURE_EN.md](docs/ARCHITECTURE_EN.md) | Architecture specification (English) |
+| [docs/README_VI.md](docs/README_VI.md) | README tiếng Việt |
+| [docs/plan.md](docs/plan.md) | Implementation plan (9 phases) |
 
 ## Tech Stack
 
 | Layer | Choice |
 |-------|--------|
 | Backend | FastAPI |
-| LLM | GPT-4o / GPT-4o-mini |
+| LLM | GPT-4o-mini |
 | SQL Parsing | sqlglot |
-| DB | SQLite |
+| DB | SQLite (hackathon) |
 | Frontend | Streamlit |
 | Deployment | Docker Compose |
 
@@ -68,25 +75,22 @@ See [README_ARCHITECTURE.md](README_ARCHITECTURE.md) for full architecture, fold
 ```text
 trustflow-banking-agent/
 ├── backend/
-│   ├── main.py              # FastAPI app + routes
-│   ├── config.py            # Thresholds, env vars
-│   ├── models.py            # Pydantic schemas
-│   ├── orchestrator.py      # Intent → route → guardian → executor → audit
-│   ├── agents/              # AgentClient interface + mock impls
-│   ├── guardian/            # Safety validation (hard rules + model checks)
-│   ├── executors/           # Post-guardian execution
-│   ├── session/             # Pending action state
-│   ├── auth/                # Mock auth (OTP, bank confirm)
-│   ├── audit/               # Append-only logging
-│   ├── prompts/             # LLM prompt templates
-│   └── data/                # Mock data + SQLite
+│   ├── main.py                 # FastAPI app + endpoints
+│   ├── config.py               # Env vars
+│   ├── models.py               # Pydantic schemas
+│   ├── agents/                 # Domain Agents + Sub-agents
+│   │   ├── orchestrator.py     # Classify intent → route
+│   │   ├── transaction.py      # TransactionAgent
+│   │   └── sub_agents/         # BeneficiaryAgent, CardResolver, etc.
+│   ├── services/               # Guardian, Friction, Session, AgentRuntime
+│   ├── executors/              # Side-effect layer (post-Guardian)
+│   ├── prompts/                # LLM prompt templates
+│   └── data/                   # Mock data (JSON + SQLite)
 ├── frontend/
-│   ├── app.py               # Streamlit main
-│   └── components/          # Chat, modals, audit viewer
+│   ├── app.py
+│   └── components/
+├── docs/                       # Architecture & planning docs
 └── tests/
-    ├── test_guardian.py
-    ├── test_hard_rules.py
-    └── scenarios/
 ```
 
 ## License

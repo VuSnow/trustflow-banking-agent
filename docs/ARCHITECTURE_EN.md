@@ -1031,7 +1031,11 @@ trustflow-banking-agent/
 ├── .env.example
 ├── requirements.txt
 ├── README.md
-├── README_ARCHITECTURE.md
+├── docs/
+│   ├── ARCHITECTURE_EN.md
+│   ├── ARCHITECTURE_VI.md
+│   ├── README_VI.md
+│   └── plan.md
 │
 ├── backend/
 │   ├── __init__.py
