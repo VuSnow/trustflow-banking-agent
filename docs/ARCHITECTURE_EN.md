@@ -40,7 +40,7 @@ User → Orchestrator classifies domain
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
-│                              USER                                     │
+│                              USER                                    │
 └──────────────────────────────┬───────────────────────────────────────┘
                                │ POST /chat
                                ▼
@@ -74,17 +74,17 @@ User → Orchestrator classifies domain
 │   → SQLGuardian → SQLExec   │                        │
 └─────────────────────────────┘                        ▼
                                ┌───────────────────────────────────────┐
-                               │ GUARDIAN                               │
-                               │ • Hard rules (block immediately)       │
-                               │ • Scoring (anomaly, scam, amount)      │
-                               │ • Risk tier → GREEN/YELLOW/ORANGE/RED  │
-                               │ • Decision: ALLOW or BLOCK only        │
-                               │ • Never generates missing fields       │
+                               │ GUARDIAN                              │
+                               │ • Hard rules (block immediately)      │
+                               │ • Scoring (anomaly, scam, amount)     │
+                               │ • Risk tier → GREEN/YELLOW/ORANGE/RED │
+                               │ • Decision: ALLOW or BLOCK only       │
+                               │ • Never generates missing fields      │
                                └───────────────────┬───────────────────┘
                                                    │
                                                    ▼
                                ┌───────────────────────────────────────┐
-                               │ FRICTION / AUTH                        │
+                               │ FRICTION / AUTH                       │
                                │ • GREEN  → bank confirm               │
                                │ • YELLOW → OTP                        │
                                │ • ORANGE → challenge + cooldown + OTP │
@@ -92,8 +92,8 @@ User → Orchestrator classifies domain
                                └───────────────────────┬───────────────┘
                                                        │ after auth
                                                        ▼
-                               ┌───────────────────────────────────────┐
-                               │ EXECUTOR (routed by PendingAction.executor_type) │
+                               ┌───────────────────────────────────────────────────┐
+                               │ EXECUTOR (routed by PendingAction.executor_type)  │
                                │ • TransactionExecutor / CardExecutor / etc.       │
                                │ • Perform side effect (mock/real)                 │
                                │ • Idempotency key prevents double-exec            │
@@ -101,10 +101,10 @@ User → Orchestrator classifies domain
                                                        │
                                                        ▼
                                ┌───────────────────────────────────────┐
-                               │ AUDIT                                  │
-                               │ • Append-only trace log                │
-                               │ • Agent delegation chain recorded      │
-                               │ • Guardian decision + reasons          │
+                               │ AUDIT                                 │
+                               │ • Append-only trace log               │
+                               │ • Agent delegation chain recorded     │
+                               │ • Guardian decision + reasons         │
                                └───────────────────────────────────────┘
 ```
 
@@ -297,8 +297,8 @@ Calling Agent (Domain Agent or sub-agent)
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         FRONTEND (Streamlit)                         │
-│  • Chat UI + risk badges (🟢🟡🟠🔴)                                  │
+│                         FRONTEND (Streamlit)                        │
+│  • Chat UI + risk badges (🟢🟡🟠🔴)                                 │
 │  • Bank confirmation modal (GREEN)                                  │
 │  • OTP step-up modal (YELLOW)                                       │
 │  • Scam alert modal (RED)                                           │
@@ -307,7 +307,7 @@ Calling Agent (Domain Agent or sub-agent)
                                │ HTTP
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    GATEWAY (FastAPI) — THIS REPO                     │
+│                    GATEWAY (FastAPI) — THIS REPO                    │
 │                                                                     │
 │  ┌───────────────────────────────────────────────────────────────┐  │
 │  │ ORCHESTRATOR                                                  │  │
@@ -391,10 +391,10 @@ Calling Agent (Domain Agent or sub-agent)
 │  │   • Risk Scorer → tier                                        │  │
 │  │                                                               │  │
 │  │ Friction Router: tier → auth requirement                      │  │
-│  │   GREEN(0–0.3)  → bank-native confirm                        │  │
-│  │   YELLOW(0.3–0.6) → warn + OTP/PIN                           │  │
-│  │   ORANGE(0.6–0.8) → challenge + cooldown + OTP               │  │
-│  │   RED(0.8–1.0) → hard block, no bypass                       │  │
+│  │   GREEN(0–0.3)  → bank-native confirm                         │  │
+│  │   YELLOW(0.3–0.6) → warn + OTP/PIN                            │  │
+│  │   ORANGE(0.6–0.8) → challenge + cooldown + OTP                │  │
+│  │   RED(0.8–1.0) → hard block, no bypass                        │  │
 │  └───────────────────────────┬───────────────────────────────────┘  │
 │                              │                                      │
 │  ┌───────────────────────────▼───────────────────────────────────┐  │
@@ -407,7 +407,7 @@ Calling Agent (Domain Agent or sub-agent)
 │  │ • LoanExecutor        → loan operations                       │  │
 │  │                                                               │  │
 │  │ ⚠️  Executors ONLY run after Guardian approves + auth passes. │  │
-│  │ ⚠️  Idempotency key prevents double-execution.               │  │
+│  │ ⚠️  Idempotency key prevents double-execution.                │  │
 │  └───────────────────────────┬───────────────────────────────────┘  │
 │                              │                                      │
 │  ┌───────────────────────────▼───────────────────────────────────┐  │
@@ -435,19 +435,19 @@ Calling Agent (Domain Agent or sub-agent)
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              CLIENT APPS                                         │
-│  Mobile Banking │ Web Banking │ Internal CRM                                     │
+│                              CLIENT APPS                                        │
+│  Mobile Banking │ Web Banking │ Internal CRM                                    │
 └──────────────────────────────┬──────────────────────────────────────────────────┘
                                │ HTTPS + JWT
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                         API GATEWAY (Kong / Envoy)                               │
-│  • Rate limiting • JWT validation • Request routing                              │
+│                         API GATEWAY (Kong / Envoy)                              │
+│  • Rate limiting • JWT validation • Request routing                             │
 └──────────────────────────────┬──────────────────────────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│           TRUSTFLOW ORCHESTRATOR SERVICE                                         │
+│           TRUSTFLOW ORCHESTRATOR SERVICE                                        │
 │                                                                                 │
 │  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────────┐     │
 │  │ Orchestrator       │  │ Guardian Service   │  │ Executor Service       │     │
@@ -496,7 +496,7 @@ Calling Agent (Domain Agent or sub-agent)
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           SHARED INFRASTRUCTURE                                  │
+│                           SHARED INFRASTRUCTURE                                 │
 │                                                                                 │
 │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  ┌──────────────┐   │
 │  │ PostgreSQL     │  │ Kafka          │  │ Elasticsearch  │  │ Prometheus   │   │
@@ -921,11 +921,11 @@ Other DATA_QUERY examples:
 ## 15. Safety Boundaries
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────────┐
 │ SAFETY BOUNDARY ENFORCEMENT                                      │
 │                                                                  │
-│ 1. LLM prepares, never executes.                                │
-│    → All LLM outputs are drafts/templates. No side effects.     │
+│ 1. LLM prepares, never executes.                                 │
+│    → All LLM outputs are drafts/templates. No side effects.      │
 │                                                                  │
 │ 2. Domain Agents can plan and delegate, cannot execute.          │
 │    → TransactionAgent builds draft, never calls bank API.        │
@@ -933,7 +933,7 @@ Other DATA_QUERY examples:
 │ 3. Sub-agents retrieve/prepare only.                             │
 │    → TransactionHistoryAgent returns candidates, not decisions.  │
 │                                                                  │
-│ 4. Guardian is external and has final authority.                  │
+│ 4. Guardian is external and has final authority.                 │
 │    → No agent can bypass. Guardian output is immutable.          │
 │                                                                  │
 │ 5. Executor is the ONLY side-effect layer.                       │
@@ -941,7 +941,7 @@ Other DATA_QUERY examples:
 │                                                                  │
 │ 6. Text2SQL is guarded and read-only.                            │
 │    → SQLGuardian validates every generated query.                │
-│    → No DML/DDL. No unscoped queries. No execution without      │
+│    → No DML/DDL. No unscoped queries. No execution without       │
 │      validation.                                                 │
 │                                                                  │
 │ 7. Transaction-critical fields must be evidence-backed.          │
@@ -953,13 +953,13 @@ Other DATA_QUERY examples:
 │      Domain Agent MUST ask for clarification.                    │
 │                                                                  │
 │ 9. High-risk actions require step-up auth.                       │
-│    → GREEN=confirm, YELLOW=OTP, ORANGE=challenge+OTP,           │
+│    → GREEN=confirm, YELLOW=OTP, ORANGE=challenge+OTP,            │
 │      RED=blocked (no bypass).                                    │
 │                                                                  │
 │ 10. Audit logs the full agent trace.                             │
 │     → Every delegation, every sub-agent call, every Guardian     │
 │       decision is recorded. Append-only, no delete.              │
-└─────────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ---

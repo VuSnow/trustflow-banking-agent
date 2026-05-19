@@ -30,13 +30,13 @@ User → Orchestrator phân loại intent
 
 ```text
 ┌─────────────────────────────────────────────────────┐
-│ ORCHESTRATOR                                         │
-│ Classify intent → route to Domain Agent              │
+│ ORCHESTRATOR                                        │
+│ Classify intent → route to Domain Agent             │
 └──────────────────────────┬──────────────────────────┘
                            ▼
 ┌─────────────────────────────────────────────────────┐
-│ DOMAIN AGENT (Transaction / Card / DataQuery / QA)   │
-│ Parse → detect missing → delegate → build draft      │
+│ DOMAIN AGENT (Transaction / Card / DataQuery / QA)  │
+│ Parse → detect missing → delegate → build draft     │
 └─────────┬───────────────────────────────┬───────────┘
           ▼                               ▼
 ┌─────────────────────┐   ┌──────────────────────────┐

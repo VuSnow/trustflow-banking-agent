@@ -40,7 +40,7 @@ User → Orchestrator phân loại domain
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
-│                              USER                                     │
+│                              USER                                    │
 └──────────────────────────────┬───────────────────────────────────────┘
                                │ POST /chat
                                ▼
@@ -56,10 +56,10 @@ User → Orchestrator phân loại domain
 │ DOMAIN AGENT (TransactionAgent / CardAgent / DataQueryAgent / ...)   │
 │ • Parse request (LLM extract structured fields)                      │
 │ • Phát hiện trường thiếu                                             │
-│ • Lên kế hoạch: gọi sub-agent nào                                   │
-│ • Ủy quyền cho sub-agent/tool đã approve                            │
-│ • Thu thập kết quả có bằng chứng                                    │
-│ • Xây dựng và trả về action_draft (KHÔNG gọi Guardian trực tiếp)    │
+│ • Lên kế hoạch: gọi sub-agent nào                                    │
+│ • Ủy quyền cho sub-agent/tool đã approve                             │
+│ • Thu thập kết quả có bằng chứng                                     │
+│ • Xây dựng và trả về action_draft (KHÔNG gọi Guardian trực tiếp)     │
 └─────────────┬────────────────────────────────────────┬───────────────┘
               │ ủy quyền                               │ trả draft
               ▼                                        ▼
@@ -74,17 +74,17 @@ User → Orchestrator phân loại domain
 │   → SQLGuardian → SQLExec   │                        │
 └─────────────────────────────┘                        ▼
                                ┌───────────────────────────────────────┐
-                               │ GUARDIAN                               │
-                               │ • Hard rules (block ngay lập tức)      │
-                               │ • Scoring (anomaly, scam, amount)      │
-                               │ • Risk tier → GREEN/YELLOW/ORANGE/RED  │
+                               │ GUARDIAN                              │
+                               │ • Hard rules (block ngay lập tức)     │
+                               │ • Scoring (anomaly, scam, amount)     │
+                               │ • Risk tier → GREEN/YELLOW/ORANGE/RED │
                                │ • Quyết định: ALLOW hoặc BLOCK        │
-                               │ • Không bao giờ sinh trường thiếu      │
+                               │ • Không bao giờ sinh trường thiếu     │
                                └───────────────────┬───────────────────┘
                                                    │
                                                    ▼
                                ┌───────────────────────────────────────┐
-                               │ FRICTION / AUTH                        │
+                               │ FRICTION / AUTH                       │
                                │ • GREEN  → xác nhận ngân hàng         │
                                │ • YELLOW → OTP                        │
                                │ • ORANGE → challenge + cooldown + OTP │
@@ -92,8 +92,8 @@ User → Orchestrator phân loại domain
                                └───────────────────────┬───────────────┘
                                                        │ sau auth
                                                        ▼
-                               ┌───────────────────────────────────────┐
-                               │ EXECUTOR (route bởi PendingAction.executor_type) │
+                               ┌───────────────────────────────────────────────────┐
+                               │ EXECUTOR (route bởi PendingAction.executor_type)  │
                                │ • TransactionExecutor / CardExecutor / ...        │
                                │ • Thực hiện side effect (mock/thật)               │
                                │ • Idempotency key chống double-exec               │
@@ -101,7 +101,7 @@ User → Orchestrator phân loại domain
                                                        │
                                                        ▼
                                ┌───────────────────────────────────────┐
-                               │ AUDIT                                  │
+                               │ AUDIT                                 │
                                │ • Trace log chỉ ghi thêm              │
                                │ • Ghi chuỗi delegation giữa agent     │
                                │ • Quyết định Guardian + lý do         │
@@ -277,8 +277,8 @@ Agent gọi (Domain Agent hoặc sub-agent)
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         FRONTEND (Streamlit)                         │
-│  • Chat UI + risk badges (🟢🟡🟠🔴)                                  │
+│                         FRONTEND (Streamlit)                        │
+│  • Chat UI + risk badges (🟢🟡🟠🔴)                                 │
 │  • Modal xác nhận ngân hàng (GREEN)                                 │
 │  • Modal OTP (YELLOW)                                               │
 │  • Modal cảnh báo scam (RED)                                        │
@@ -287,7 +287,7 @@ Agent gọi (Domain Agent hoặc sub-agent)
                                │ HTTP
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    GATEWAY (FastAPI) — REPO NÀY                      │
+│                    GATEWAY (FastAPI) — REPO NÀY                     │
 │                                                                     │
 │  ┌───────────────────────────────────────────────────────────────┐  │
 │  │ ORCHESTRATOR                                                  │  │
@@ -297,7 +297,7 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │  └───────────────────────────┬───────────────────────────────────┘  │
 │                              │                                      │
 │  ┌───────────────────────────▼───────────────────────────────────┐  │
-│  │ DOMAIN AGENTS (lên kế hoạch + ủy quyền + xây draft)          │  │
+│  │ DOMAIN AGENTS (lên kế hoạch + ủy quyền + xây draft)           │  │
 │  │                                                               │  │
 │  │ • TransactionAgent:                                           │  │
 │  │   → Parse message (LLM extract)                               │  │
@@ -315,7 +315,7 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │  │ • DataQueryAgent:                                             │  │
 │  │   → Lên kế hoạch read-only query                              │  │
 │  │   → Ủy quyền cho Text2SQLAgent → SQLGuardian → SQLExecutor    │  │
-│  │   → Tóm tắt kết quả bằng ngôn ngữ tự nhiên                   │  │
+│  │   → Tóm tắt kết quả bằng ngôn ngữ tự nhiên                    │  │
 │  │                                                               │  │
 │  │ • QAAgent:                                                    │  │
 │  │   → Ủy quyền cho PolicyRetrieverAgent                         │  │
@@ -325,18 +325,18 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │  └───────────────────────────┬───────────────────────────────────┘  │
 │                              │                                      │
 │  ┌───────────────────────────▼───────────────────────────────────┐  │
-│  │ SUB-AGENTS / TOOLS (truy xuất + chuẩn bị, không thực thi)    │  │
+│  │ SUB-AGENTS / TOOLS (truy xuất + chuẩn bị, không thực thi)     │  │
 │  │                                                               │  │
 │  │ • RecipientResolutionAgent  → resolve người nhận đã lưu       │  │
-│  │ • TransactionHistoryAgent   → tìm giao dịch cũ (qua Text2SQL)│  │
+│  │ • TransactionHistoryAgent   → tìm giao dịch cũ (qua Text2SQL) │  │
 │  │ • BeneficiaryAgent          → quản lý danh sách người nhận    │  │
 │  │ • CardResolverAgent         → resolve thẻ mục tiêu            │  │
 │  │ • AccountProfileAgent       → resolve thông tin tài khoản     │  │
-│  │ • LoanInfoAgent             → tra cứu chi tiết khoản vay     │  │
+│  │ • LoanInfoAgent             → tra cứu chi tiết khoản vay      │  │
 │  │ • PolicyRetrieverAgent      → truy xuất policy docs + version │  │
 │  │ • Text2SQLAgent             → chỉ sinh SQL                    │  │
 │  │                                                               │  │
-│  │ ⚠️  Sub-agent chỉ chuẩn bị/truy xuất.                        │  │
+│  │ ⚠️  Sub-agent chỉ chuẩn bị/truy xuất.                         │  │
 │  │ ⚠️  Trả bằng chứng + confidence.                              │  │
 │  │ ⚠️  Không bao giờ thực thi side effect.                       │  │
 │  └───────────────────────────┬───────────────────────────────────┘  │
@@ -348,10 +348,10 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │  │ → SQLGuardian validate:                                       │  │
 │  │   • Chỉ SELECT (không DML/DDL)                                │  │
 │  │   • Table trong allowlist                                     │  │
-│  │   • user_id scope bắt buộc                                   │  │
-│  │   • LIMIT có mặt khi cần                                     │  │
+│  │   • user_id scope bắt buộc                                    │  │
+│  │   • LIMIT có mặt khi cần                                      │  │
 │  │ → SQLExecutor thực thi (parameterized, user_id từ auth)       │  │
-│  │ → Kết quả trả về agent gọi kèm bằng chứng                   │  │
+│  │ → Kết quả trả về agent gọi kèm bằng chứng                     │  │
 │  └───────────────────────────┬───────────────────────────────────┘  │
 │                              │                                      │
 │  ┌───────────────────────────▼───────────────────────────────────┐  │
@@ -360,9 +360,9 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │  │ Layer 1: HARD RULES (deterministic, quyết định ngay)          │  │
 │  │   • Recipient trong reported_accounts → RED                   │  │
 │  │   • Số tiền > daily_limit → BLOCK                             │  │
-│  │   • Từ khóa áp lực/đe dọa → ORANGE tối thiểu                 │  │
-│  │   • SQL chứa DML/DDL → REJECT                                │  │
-│  │   → Nếu trigger: BỎ QUA Layer 2, đi thẳng decision           │  │
+│  │   • Từ khóa áp lực/đe dọa → ORANGE tối thiểu                  │  │
+│  │   • SQL chứa DML/DDL → REJECT                                 │  │
+│  │   → Nếu trigger: BỎ QUA Layer 2, đi thẳng decision            │  │
 │  │                                                               │  │
 │  │ Layer 2: MODEL-BASED (chỉ khi không hard rule nào trigger)    │  │
 │  │   • Anomaly Detector (số tiền/người nhận/urgency/thời gian)   │  │
@@ -370,31 +370,31 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │  │   • Risk Scorer → tier                                        │  │
 │  │                                                               │  │
 │  │ Friction Router: tier → auth requirement                      │  │
-│  │   GREEN(0–0.3)  → xác nhận ngân hàng                         │  │
-│  │   YELLOW(0.3–0.6) → cảnh báo + OTP/PIN                       │  │
-│  │   ORANGE(0.6–0.8) → challenge + cooldown + OTP               │  │
-│  │   RED(0.8–1.0) → chặn hoàn toàn, không bypass                │  │
+│  │   GREEN(0–0.3)  → xác nhận ngân hàng                          │  │
+│  │   YELLOW(0.3–0.6) → cảnh báo + OTP/PIN                        │  │
+│  │   ORANGE(0.6–0.8) → challenge + cooldown + OTP                │  │
+│  │   RED(0.8–1.0) → chặn hoàn toàn, không bypass                 │  │
 │  └───────────────────────────┬───────────────────────────────────┘  │
 │                              │                                      │
 │  ┌───────────────────────────▼───────────────────────────────────┐  │
 │  │ EXECUTORS (sau guardian, tách biệt khỏi agent)                │  │
 │  │                                                               │  │
 │  │ • TransactionExecutor → gọi bank API (mock trong hackathon)   │  │
-│  │ • CardExecutor        → khóa/mở khóa/cấp lại thẻ            │  │
+│  │ • CardExecutor        → khóa/mở khóa/cấp lại thẻ              │  │
 │  │ • SQLExecutor         → chạy read-only query đã validate      │  │
-│  │ • AccountExecutor     → thao tác tài khoản                   │  │
-│  │ • LoanExecutor        → thao tác khoản vay                   │  │
+│  │ • AccountExecutor     → thao tác tài khoản                    │  │
+│  │ • LoanExecutor        → thao tác khoản vay                    │  │
 │  │                                                               │  │
 │  │ ⚠️  Executor CHỈ chạy sau khi Guardian approve + auth pass.   │  │
 │  │ ⚠️  Idempotency key chống double-execution.                   │  │
 │  └───────────────────────────┬───────────────────────────────────┘  │
 │                              │                                      │
 │  ┌───────────────────────────▼───────────────────────────────────┐  │
-│  │ AUDIT (chỉ ghi thêm)                                         │  │
-│  │ • Trace bất biến mỗi request                                 │  │
-│  │ • Chuỗi delegation giữa agent được ghi lại                   │  │
+│  │ AUDIT (chỉ ghi thêm)                                          │  │
+│  │ • Trace bất biến mỗi request                                  │  │
+│  │ • Chuỗi delegation giữa agent được ghi lại                    │  │
 │  │ • Quyết định Guardian + lý do                                 │  │
-│  │ • Các cuộc gọi sub-agent + bằng chứng                        │  │
+│  │ • Các cuộc gọi sub-agent + bằng chứng                         │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 │                                                                     │
 │  ┌───────────────────────────────────────────────────────────────┐  │
@@ -414,19 +414,19 @@ Agent gọi (Domain Agent hoặc sub-agent)
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              CLIENT APPS                                         │
-│  Mobile Banking │ Web Banking │ Internal CRM                                     │
+│                              CLIENT APPS                                        │
+│  Mobile Banking │ Web Banking │ Internal CRM                                    │
 └──────────────────────────────┬──────────────────────────────────────────────────┘
                                │ HTTPS + JWT
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                         API GATEWAY (Kong / Envoy)                               │
-│  • Rate limiting • JWT validation • Request routing                              │
+│                         API GATEWAY (Kong / Envoy)                              │
+│  • Rate limiting • JWT validation • Request routing                             │
 └──────────────────────────────┬──────────────────────────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│           TRUSTFLOW ORCHESTRATOR SERVICE                                         │
+│           TRUSTFLOW ORCHESTRATOR SERVICE                                        │
 │                                                                                 │
 │  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────────┐     │
 │  │ Orchestrator       │  │ Guardian Service   │  │ Executor Service       │     │
@@ -455,7 +455,7 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │ • Card           │ │ • Schema-aware   │ │ • Vector search      │
 │ • Account        │ │ • Multi-dialect  │ │ • Citation + version │
 │ • Loan           │ │                  │ │                      │
-│                  │ │ ⚠️ KHÔNG thực    │ │ ⚠️ Chỉ chuẩn bị     │
+│                  │ │ ⚠️ KHÔNG thực    │ │ ⚠️ Chỉ chuẩn bị      │
 │ ⚠️ KHÔNG side    │ │   thi SQL ở đây  │ │                      │
 │   effect ở đây   │ │                  │ │                      │
 └──────────────────┘ └──────────────────┘ └──────────────────────┘
@@ -878,16 +878,16 @@ Ví dụ khác:
 ## 15. Ranh giới An toàn
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────────┐
 │ THỰC THI RANH GIỚI AN TOÀN                                       │
 │                                                                  │
-│ 1. LLM chuẩn bị, không bao giờ thực thi.                        │
-│    → Mọi output LLM là draft/template. Không side effect.       │
+│ 1. LLM chuẩn bị, không bao giờ thực thi.                         │
+│    → Mọi output LLM là draft/template. Không side effect.        │
 │                                                                  │
-│ 2. Domain Agent lên kế hoạch và ủy quyền, không thực thi.       │
-│    → TransactionAgent xây draft, không gọi bank API.            │
+│ 2. Domain Agent lên kế hoạch và ủy quyền, không thực thi.        │
+│    → TransactionAgent xây draft, không gọi bank API.             │
 │                                                                  │
-│ 3. Sub-agent chỉ truy xuất/chuẩn bị.                            │
+│ 3. Sub-agent chỉ truy xuất/chuẩn bị.                             │
 │    → TransactionHistoryAgent trả candidates, không decisions.    │
 │                                                                  │
 │ 4. Guardian là external và có quyền tối cao.                     │
@@ -896,27 +896,27 @@ Ví dụ khác:
 │ 5. Executor là tầng side-effect DUY NHẤT.                        │
 │    → Chạy sau Guardian approval + user auth.                     │
 │                                                                  │
-│ 6. Text2SQL được bảo vệ và chỉ đọc.                             │
+│ 6. Text2SQL được bảo vệ và chỉ đọc.                              │
 │    → SQLGuardian validate mọi query sinh ra.                     │
 │    → Không DML/DDL. Không query unscoped. Không execute          │
 │      mà không validate.                                          │
 │                                                                  │
-│ 7. Trường giao dịch quan trọng phải có bằng chứng.              │
-│    → recipient_account resolve từ history/beneficiary             │
+│ 7. Trường giao dịch quan trọng phải có bằng chứng.               │
+│    → recipient_account resolve từ history/beneficiary            │
 │      phải gồm source_transaction_id + confidence.                │
 │                                                                  │
-│ 8. Confidence thấp → hỏi user.                                  │
+│ 8. Confidence thấp → hỏi user.                                   │
 │    → Nếu confidence < threshold hoặc nhiều candidate,            │
 │      Domain Agent BẮT BUỘC hỏi clarification.                    │
 │                                                                  │
 │ 9. Hành động high-risk cần step-up auth.                         │
 │    → GREEN=confirm, YELLOW=OTP, ORANGE=challenge+OTP,            │
-│      RED=blocked (không bypass).                                  │
+│      RED=blocked (không bypass).                                 │
 │                                                                  │
 │ 10. Audit log toàn bộ agent trace.                               │
-│     → Mọi delegation, mọi sub-agent call, mọi quyết định        │
-│       Guardian đều được ghi. Chỉ ghi thêm, không xóa.           │
-└─────────────────────────────────────────────────────────────────┘
+│     → Mọi delegation, mọi sub-agent call, mọi quyết định         │
+│       Guardian đều được ghi. Chỉ ghi thêm, không xóa.            │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ---
