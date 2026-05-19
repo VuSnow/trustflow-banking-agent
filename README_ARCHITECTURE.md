@@ -7,30 +7,34 @@
 **Core Principle:**
 
 ```text
-Orchestrator routes → AgentClient prepares → Guardian validates → Executor executes → Audit logs
+Orchestrator selects Workflow → AgentClient prepares → Guardian validates → Executor executes → Audit logs
 ```
 
 - **LLM prepares, never executes.** Agent only creates drafts/payloads.
 - **Hard rules first, model second.** Deterministic safety before probabilistic scoring.
 - **Executor is separate from Agent.** Agent prepares; Executor acts after Guardian approves.
+- **Workflow-driven routing.** Orchestrator selects a predefined workflow; workflows define steps.
 - **Immutable audit trail.** Append-only, every decision explained.
 
 ---
 
 ## Repo Scope
 
-This repo is **Orchestrator + Guardian + Executors + Frontend**.
+This repo is **Orchestrator + Workflows + Guardian + Executors + Frontend**.
 
 Specialist agents (Text2SQL, QA RAG, Transaction Parser) are designed behind an `AgentClient` interface. In hackathon: mock implementations live here. In production: swap to HTTP/gRPC clients calling separate services.
 
+Agent routing uses an **Agent Registry** (JSON file / DB) for lookup. Orchestrator does NOT hardcode which agent handles what — it queries the registry by `task_type`.
+
 ```text
 ┌─────────────────────────────────────┐
-│  THIS REPO                          │
-│  • Orchestrator (routing + wiring)  │
-│  • Guardian (safety layer)          │
-│  • Executors (post-guardian action) │
-│  • Frontend (demo UI)               │
-│  • AgentClient mocks                │
+│  THIS REPO                           │
+│  • Orchestrator (intent + routing)   │
+│  • Workflows (predefined step flows) │
+│  • Guardian (safety layer)           │
+│  • Executors (post-guardian action)  │
+│  • Frontend (demo UI)                │
+│  • Agent Registry + AgentClient mocks│
 └─────────────────────────────────────┘
          │
          │ Interface call (hackathon: local, production: HTTP/gRPC)
@@ -64,10 +68,19 @@ Specialist agents (Text2SQL, QA RAG, Transaction Parser) are designed behind an 
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │ ORCHESTRATOR                                              │  │
 │  │ • Intent classification (1 LLM call)                      │  │
-│  │ • Route to AgentClient (via interface)                    │  │
-│  │ • Pass agent output → Guardian                            │  │
-│  │ • If Guardian approves → Executor                         │  │
+│  │ • Select predefined Workflow by task_type                 │  │
+│  │ • Workflow runs: Agent → Guardian → Executor              │  │
 │  │ • Compile response → Frontend                             │  │
+│  └───────────────────────────┬───────────────────────────────┘  │
+│                              │                                  │
+│  ┌───────────────────────────▼───────────────────────────────┐  │
+│  │ WORKFLOWS (predefined step sequences per business op)     │  │
+│  │                                                           │  │
+│  │ • TransferWorkflow    → prepare → guardian → exec/pending │  │
+│  │ • SpendingQueryWorkflow → prepare → guardian → exec SQL   │  │
+│  │ • PolicyQAWorkflow    → prepare → guardian → return answer│  │
+│  │                                                           │  │
+│  │ Each workflow owns its full flow. Orchestrator stays thin.│  │
 │  └───────────────────────────┬───────────────────────────────┘  │
 │                              │                                  │
 │  ┌───────────────────────────▼───────────────────────────────┐  │
@@ -169,23 +182,25 @@ GET  /audit/{audit_id}                  # Retrieve audit trail for a request
 ```text
 1. User sends message → POST /chat
 2. Orchestrator classifies intent + extracts entities (1 LLM call)
-3. Orchestrator routes to appropriate AgentClient
-4. AgentClient.prepare() → AgentOutput (payload/SQL/answer draft)
-     ↳ If missing critical fields → return {needs_clarification: true}
-5. Guardian.validate(agent_output, user_context)
-     ↳ Layer 1: hard rules check
-     ↳ Layer 2: model-based scoring (if no hard rule triggered)
-     ↳ Output: {risk_tier, score, reasons[], triggered_by}
-6. Friction Router decides auth requirement based on tier
-7. If pending_auth (GREEN needs confirm, YELLOW/ORANGE needs OTP):
-     ↳ Store pending action in SessionStore
-     ↳ Return {status: pending_auth, pending_action_id, transaction_preview}
-     ↳ User confirms → POST /actions/{id}/confirm or /otp
-8. If approved:
-     ↳ Executor.execute(agent_output, auth_context) → result
-     ↳ NOTE: SQLExecutor injects user_id from auth context, NEVER from LLM output
-9. Audit.log(full trace)
-10. Response compiled → Frontend
+3. Orchestrator selects Workflow by task_type (via registry lookup)
+4. Workflow executes:
+   4a. Resolve AgentClient from Agent Registry by task_type
+   4b. AgentClient.prepare() → AgentOutput (payload/SQL/answer draft)
+       ↳ If missing critical fields → return {needs_clarification: true}
+   4c. Guardian.validate(agent_output, user_context)
+       ↳ Layer 1: hard rules check
+       ↳ Layer 2: model-based scoring (if no hard rule triggered)
+       ↳ Output: {risk_tier, score, reasons[], triggered_by}
+   4d. Friction Router decides auth requirement based on tier
+   4e. If pending_auth (GREEN needs confirm, YELLOW/ORANGE needs OTP):
+       ↳ Store pending action in SessionStore
+       ↳ Return {status: pending_auth, pending_action_id, transaction_preview}
+       ↳ User confirms → POST /actions/{id}/confirm or /otp
+   4f. If approved:
+       ↳ Executor.execute(agent_output, auth_context) → result
+       ↳ NOTE: SQLExecutor injects user_id from auth context, NEVER from LLM output
+5. Audit.log(full trace)
+6. Response compiled → Frontend
 ```
 
 ---
@@ -205,11 +220,19 @@ trustflow-banking-agent/
 │   ├── main.py                          # FastAPI app, routes (see API below)
 │   ├── config.py                        # Thresholds, env vars, feature flags
 │   ├── models.py                        # Pydantic schemas (see below)
-│   ├── orchestrator.py                  # Intent → route → guardian → executor → audit
+│   ├── orchestrator.py                  # Intent classify + select workflow (thin)
+│   │
+│   ├── workflows/                        # Predefined business operation flows
+│   │   ├── __init__.py
+│   │   ├── base.py                      # Workflow ABC: run(request, intent, ctx) → ChatResponse
+│   │   ├── transfer.py                  # TransferWorkflow: prepare → guardian → exec/pending
+│   │   ├── spending_query.py            # SpendingQueryWorkflow: prepare → guardian → SQL exec
+│   │   └── policy_qa.py                 # PolicyQAWorkflow: prepare → guardian → answer
 │   │
 │   ├── agents/                          # AgentClient interface + mock impls
 │   │   ├── __init__.py
 │   │   ├── base.py                      # AgentClient ABC: prepare(input, ctx) → AgentOutput
+│   │   ├── registry.py                  # Agent registry: task_type → agent lookup
 │   │   ├── transaction_client.py        # Mock: LLM parse NL → transfer payload
 │   │   ├── text2sql_client.py           # Mock: LLM NL → SQL + explanation
 │   │   └── qa_client.py                 # Mock: keyword search over policies
@@ -253,6 +276,7 @@ trustflow-banking-agent/
 │       ├── users.json                   # 3 users + behavioral baselines
 │       ├── reported_accounts.json       # Hard-block scam registry
 │       ├── scam_patterns.json           # Known scam templates
+│       ├── agent_registry.json          # Agent registry: id, task_types, status
 │       ├── table_allowlist.json         # Permitted tables + columns for SQL
 │       ├── transactions.db              # SQLite (pre-seeded from seed script)
 │       ├── seed_db.py                   # Script to create SQLite from JSON
@@ -305,13 +329,13 @@ class ChatResponse:
     audit_id: str
 
 class ActionConfirmRequest:
-    action_id: str
     user_id: str
+    # action_id comes from URL path: POST /actions/{action_id}/confirm
 
 class OTPVerifyRequest:
-    action_id: str
     user_id: str
     otp_code: str
+    # action_id comes from URL path: POST /actions/{action_id}/otp
 
 # === Intent ===
 class IntentResult:
@@ -438,28 +462,32 @@ Production adds: `analyze_spending`, `submit_onboarding`, `manage_beneficiaries`
 
 ```text
 User: "Transfer 2M to Minh for lunch"
-→ Orchestrator: intent=TRANSACTION, entities={amount:2M, recipient:"Minh", note:"lunch"}
-→ TransactionAgentClient.prepare() → {from:"user_account", to:"minh_account", amount:2000000, note:"lunch"}
-→ Guardian L1: recipient not reported ✓, within limit ✓, consent OK ✓
-→ Guardian L2: anomaly(0.08) + scam(0.02) → score=0.06 → GREEN
-→ Friction: bank-native confirm required
-→ Frontend: show exact preview → user confirms
+→ Orchestrator: classify intent=TRANSACTION, entities={amount:2M, recipient:"Minh", note:"lunch"}
+→ Orchestrator: select TransferWorkflow
+→ TransferWorkflow:
+  → Agent Registry lookup(TRANSACTION) → TransactionAgentClient
+  → TransactionAgentClient.prepare() → {from:"user_account", to:"minh_account", amount:2000000}
+  → Guardian L1: recipient not reported ✓, within limit ✓, consent OK ✓
+  → Guardian L2: anomaly(0.08) + scam(0.02) → score=0.06 → GREEN
+  → Friction: bank-native confirm required
+  → Save pending action → return pending_auth
+→ Frontend: show exact preview → user confirms → POST /actions/{id}/confirm
 → TransactionExecutor.execute() → success
 → Audit.log(full trace)
-→ Response: "Transferred 2,000,000₫ to Minh. Your balance: 48,000,000₫"
+→ Response: "Transferred 2,000,000₫ to Minh."
 ```
 
 ### B. Scam Block (RED)
 
 ```text
 User: "Transfer 50M to account 0391234567"
-→ Orchestrator: intent=TRANSACTION, entities={amount:50M, recipient:"0391234567"}
-→ TransactionAgentClient.prepare() → {to:"0391234567", amount:50000000}
-→ Guardian L1: recipient IN reported_accounts → instant RED
-→ SKIP Layer 2
-→ Friction: BLOCKED, no bypass
-→ Response: "This account has been reported by multiple users for fraud.
-             Transaction blocked. Please contact hotline 1900-xxxx or visit your branch."
+→ Orchestrator: classify intent=TRANSACTION → select TransferWorkflow
+→ TransferWorkflow:
+  → TransactionAgentClient.prepare() → {to:"0391234567", amount:50000000}
+  → Guardian L1: recipient IN reported_accounts → instant RED
+  → SKIP Layer 2
+  → Friction: BLOCKED, no bypass
+→ Response: "This account has been reported. Transaction blocked."
 → Audit.log(hard_rule="reported_recipient")
 ```
 
@@ -467,13 +495,15 @@ User: "Transfer 50M to account 0391234567"
 
 ```text
 User: "Transfer 20M to Lan"
-→ Orchestrator: intent=TRANSACTION, entities={amount:20M, recipient:"Lan"}
-→ TransactionAgentClient.prepare() → {to:"lan_account", amount:20000000}
-→ Guardian L1: no hard rule triggered
-→ Guardian L2: anomaly(0.45, reason:"amount 4x user average") + scam(0.10) → score=0.38 → YELLOW
-→ Friction: warn + OTP required
-→ Frontend: "This amount is higher than your usual transfers. Please verify with OTP."
-→ User enters OTP → verified
+→ Orchestrator: classify intent=TRANSACTION → select TransferWorkflow
+→ TransferWorkflow:
+  → TransactionAgentClient.prepare() → {to:"lan_account", amount:20000000}
+  → Guardian L1: no hard rule triggered
+  → Guardian L2: anomaly(0.45) + scam(0.10) → score=0.38 → YELLOW
+  → Friction: warn + OTP required
+  → Save pending action → return pending_auth
+→ Frontend: "Unusual amount. Please verify with OTP."
+→ User enters OTP → POST /actions/{id}/otp → verified
 → TransactionExecutor.execute() → success
 → Audit.log(auth_method="otp", auth_verified=true)
 ```
@@ -482,11 +512,13 @@ User: "Transfer 20M to Lan"
 
 ```text
 User: "How much did I spend on food this month?"
-→ Orchestrator: intent=DATA_QUERY, entities={category:"food", time:"this month"}
-→ Text2SQLAgentClient.prepare() → {sql:"SELECT SUM(amount)...", explanation:"..."}
-→ Guardian L1: no DML/DDL ✓
-→ Guardian L2: AST valid, tables in allowlist, WHERE user_id enforced, LIMIT present ✓
-→ SQLExecutor.execute() → {result: 8500000}
+→ Orchestrator: classify intent=DATA_QUERY → select SpendingQueryWorkflow
+→ SpendingQueryWorkflow:
+  → Agent Registry lookup(DATA_QUERY) → Text2SQLAgentClient
+  → Text2SQLAgentClient.prepare() → {sql_template:"SELECT SUM(amount)...", params:{category:"food"}}
+  → Guardian L1: no DML/DDL ✓
+  → Guardian L2: AST valid, tables in allowlist, WHERE user_id enforced, LIMIT present ✓
+  → SQLExecutor.execute(sql_template, params, inject user_id from auth) → {result: 8500000}
 → Response: "You spent 8,500,000₫ on food this month."
 → Audit.log()
 ```
@@ -649,8 +681,8 @@ User: "How much did I spend on food this month?"
 ## Key Design Decisions
 
 | Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Executor separate from Agent | Yes | Agent prepares, Guardian validates, Executor acts. Clean separation of concerns |
+|----------|--------|-----------|| Workflow registry | Predefined flows per task_type | Orchestrator stays thin, each workflow is testable, extensible |
+| Agent registry | JSON file (hackathon) / DB (prod) | Add/disable agents without code change, deterministic routing || Executor separate from Agent | Yes | Agent prepares, Guardian validates, Executor acts. Clean separation of concerns |
 | Agent = interface | ABC with `prepare()` | Swap mock ↔ HTTP client without changing orchestrator |
 | Scam in Phase 1 | Yes (pattern match) | Risk scorer needs all inputs from Day 1. LLM advisory added later |
 | Consent scopes | 2 for hackathon | `read_data` + `execute_transfer`. More in production |
