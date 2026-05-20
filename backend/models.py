@@ -1,3 +1,4 @@
+# backend/models.py
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
@@ -10,9 +11,83 @@ class ChatRequest(BaseModel):
     message: str
     session_id: str
 
+
+class ChatResponse(BaseModel):
+    """Stable API contract — fields added once, never removed.
+    Unused fields stay None until the phase that needs them."""
+    status: str
+    message: str
+    data: dict | None = None
+    pending_action_id: str | None = None
+    action_preview: dict | None = None
+    risk_tier: str | None = None
+    auth_required: str | None = None
+
+
 class IntentResult(BaseModel):
     status: Literal["complete", "error"]
-    task_type: Literal["QA", "DATA_QUERY", "TRANSACTION", "CARD_OPERATION", "ACCOUNT_OPERATION", "LOAN_OPERATION", "ERROR"]
+    task_type: Literal["QA", "DATA_QUERY", "TRANSACTION",
+                       "CARD_OPERATION", "ACCOUNT_OPERATION", "LOAN_OPERATION", "ERROR"]
     operation: Optional[str] = None
     confidence: float
-    reason: str    
+    reason: str
+
+
+class TransactionExtraction(BaseModel):
+    """Typed extraction from user message — core banking entity parsing.
+    Maps 1:1 with the LLM extraction prompt output schema."""
+    action: Literal["TRANSFER_MONEY", "BILL_PAYMENT", "TOP_UP", "UNKNOWN"]
+    amount: int | None = None
+    currency: str = "VND"
+    recipient_hint: str | None = None
+    recipient_account: str | None = None
+    recipient_bank: str | None = None
+    bill_provider: str | None = None
+    customer_code: str | None = None
+    topup_target: str | None = None
+    source_account_hint: str | None = None
+    purpose_hint: str | None = None
+    note: str | None = None
+    reference_context: dict | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+    resolvable_fields: list[str] = Field(default_factory=list)
+    needs_clarification: bool = False
+    clarification_reason: str | None = None
+    confidence: float = 0.0
+
+
+class ActionDraft(BaseModel):
+    """Typed draft for Guardian input — never raw dict at boundaries.
+    This is what gets stored as PendingAction.draft later."""
+    action_type: str          # "TRANSACTION", "CARD_OPERATION", etc.
+    operation: str            # "TRANSFER_MONEY", "LOCK_CARD", etc.
+    amount: int | None = None
+    currency: str = "VND"
+    recipient_name: str | None = None
+    recipient_account: str | None = None
+    recipient_bank: str | None = None
+    note: str | None = None
+
+
+class AgentTask(BaseModel):
+    """Generic task request from domain agent to sub-agent."""
+    task_type: str                                    # e.g. "resolve_by_name", "resolve_by_account"
+    context: dict = Field(default_factory=dict)       # shared context
+    constraints: dict = Field(default_factory=dict)   # task-specific params
+
+
+class AgentTaskResult(BaseModel):
+    """Generic task response from sub-agent back to domain agent."""
+    status: Literal["success", "failed", "needs_clarification"]
+    result: dict = Field(default_factory=dict)
+    confidence: float = 1.0
+
+
+class DomainAgentOutput(BaseModel):
+    """Standard output of any domain agent. Orchestrator doesn't care
+    which agent produced it — same shape regardless."""
+    status: Literal["draft_ready", "clarification_needed", "info_response"]
+    action_draft: ActionDraft | None = None
+    clarification_message: str | None = None
+    info_response: str | None = None
+    delegation_trace: list[str] = Field(default_factory=list)

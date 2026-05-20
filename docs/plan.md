@@ -2,43 +2,248 @@
 
 ## Overview
 
-Incremental implementation following the agent-to-agent architecture.
-Each step only codes what is needed to test THAT step. No pre-creating models/endpoints/files for later use.
+Incremental implementation following agent-to-agent architecture with **hybrid control**:
+- **Fixed outer control plane** for safety-critical flow (Guardian, Friction, Executor)
+- **Dynamic inner agent planning** for domain-level resolution (sub-agent orchestration)
+- **Constrained Text2SQL** for evidence retrieval only — never for execution
 
-**Current state:** Basic FastAPI server + intent classification + transaction extraction (old design).
-**Target state:** Full agent-to-agent with Guardian + Friction + Executor (MUST HAVE scope).
+**Architecture principle:**
+```
+The system uses a fixed safety-critical control plane and dynamic domain-level planning.
+The orchestrator only routes to the correct domain agent.
+Each domain agent generates and executes its own validated resolution plan
+through an allowlisted agent registry.
+Text2SQL is allowed only as an evidence-retrieval sub-agent — constrained SELECT queries,
+validated by SQLGuardian, executed with injected user_id from backend context.
+Execution, Guardian checks, authentication friction, and final action execution
+remain outside LLM planning scope.
+```
+
+**Current state:** Basic FastAPI server + intent classification (Phase 2 complete).
+**Target state:** Full agent-to-agent with realistic banking DB, dynamic planning, Guardian + Friction + Executor.
 
 **Rule:** Nếu step X không cần model Y, thì model Y chưa tồn tại. Code đúng minimum cần để test pass.
 
 ---
 
+## Architecture: Fixed Outer + Dynamic Inner
+
+```text
+/chat
+→ IntentClassifier                     # fixed
+→ DomainAgentRouter                    # fixed (thin map, no business logic)
+→ DomainAgent.extract()                # domain-specific LLM extraction
+→ DomainAgent.plan()                   # DYNAMIC — LLM generates resolution plan
+→ PlanValidator                        # fixed safety — allowlist, max steps, resolution-only
+→ PlanExecutor                         # executes allowed sub-agents sequentially
+    ├── RecipientResolutionAgent       # queries DB: saved beneficiaries + transaction history
+    ├── Text2SQLAgent                  # LLM → constrained SELECT → SQLGuardian → SQLExecutor
+    └── (other sub-agents)
+→ DomainAgent.build_output()           # builds typed ActionDraft from resolved data
+→ Guardian                             # fixed mandatory — hard rules + risk scoring
+→ FrictionRouter                       # fixed mandatory — maps risk tier to auth method
+→ PendingAction / Response
+→ [User confirms/OTP]
+→ Executor                             # fixed — only runs after auth succeeds
+```
+
+**Key constraints:**
+1. LLM planner generates **resolution plans only** (resolve recipient, lookup history)
+2. LLM planner **CANNOT** generate execution steps (transfer, approve, bypass)
+3. Text2SQL generates **SELECT only** — validated by SQLGuardian before execution
+4. SQLExecutor **injects user_id from backend context** — never trusts LLM-generated user_id
+5. RecipientResolutionAgent may **auto-resolve only when there is exactly one high-confidence verified candidate**. If multiple plausible candidates or low confidence → must return clarification_needed
+
+---
+
+## Summary Flow
+
+```text
+TrustFlow Guardian uses a fixed safety-critical outer control plane and dynamic inner domain planning.
+
+The outer control plane is deterministic:
+IntentClassifier → DomainAgentRouter → Guardian → FrictionRouter → PendingAction → Human Confirm/OTP → Executor.
+
+The inner domain flow is agentic:
+TransactionAgent extracts structured transaction intent, generates a validated resolution plan, and calls allowlisted sub-agents such as RecipientResolutionAgent and Text2SQLAgent.
+
+Text2SQLAgent is used only when historical banking evidence is needed, such as "like last month" or "the person I sent the most money to". It can only generate constrained SELECT queries. SQLGuardian validates the query, and SQLExecutor injects user_id from backend context.
+
+RecipientResolutionAgent converts evidence into verified recipient candidates. It may auto-resolve only when there is exactly one high-confidence verified candidate. Otherwise, it returns clarification_needed.
+
+TransactionAgent builds an ActionDraft only after required fields are resolved. Every ActionDraft must pass through Guardian. Execution happens only after human confirmation or OTP.
+```
+
+---
+
+## Data Foundation: banking.db
+
+Created at Phase 3. Used by RecipientResolutionAgent, Text2SQLAgent, and DataQueryAgent.
+
+**Schema:**
+```sql
+CREATE TABLE users (
+    user_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    phone TEXT,
+    email TEXT,
+    created_at TEXT
+);
+
+CREATE TABLE accounts (
+    account_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    account_number TEXT NOT NULL,
+    bank_name TEXT NOT NULL,
+    account_type TEXT DEFAULT 'checking',  -- checking, savings
+    balance INTEGER DEFAULT 0,
+    currency TEXT DEFAULT 'VND',
+    status TEXT DEFAULT 'active'
+);
+
+CREATE TABLE beneficiaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    name TEXT NOT NULL,
+    nicknames TEXT,              -- JSON array: ["Minh", "anh Minh"]
+    account_number TEXT NOT NULL,
+    bank_name TEXT NOT NULL,
+    created_at TEXT,
+    last_used_at TEXT
+);
+
+CREATE TABLE transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    source_account TEXT NOT NULL,
+    recipient_name TEXT NOT NULL,
+    recipient_account TEXT NOT NULL,
+    recipient_bank TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    currency TEXT DEFAULT 'VND',
+    category TEXT,              -- food, bills, transfer, salary, etc.
+    transaction_type TEXT,      -- transfer, bill_payment, top_up
+    note TEXT,
+    status TEXT DEFAULT 'completed',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE reported_accounts (
+    account_number TEXT PRIMARY KEY,
+    bank_name TEXT,
+    reason TEXT,                -- scam, fraud, suspicious
+    reported_at TEXT,
+    severity TEXT DEFAULT 'high'  -- high, medium
+);
+```
+
+**Seed data:** 2 users, 3-5 beneficiaries per user, 50-100 transactions, 3-5 reported accounts.
+
+---
+
+## Demo Scenarios (target)
+
+These 5 scenarios drive the implementation:
+
+### Scenario 1: "Chuyển 2tr cho Minh"
+```text
+Extract: action=TRANSFER_MONEY, amount=2000000, recipient_hint="Minh"
+Plan: [recipient_resolution.resolve_by_name(name="Minh")]
+Resolution: query beneficiaries → 1 match "Nguyễn Văn Minh" (VCB 012xxx)
+Draft: ActionDraft(amount=2000000, recipient_name="Nguyễn Văn Minh", recipient_account="0123456789")
+Guardian: GREEN (known recipient, low amount)
+Friction: bank_confirm
+→ User confirms → Executed
+```
+
+### Scenario 2: "Chuyển cho Minh 2 triệu như tháng trước"
+```text
+Extract: action=TRANSFER_MONEY, amount=2000000, recipient_hint="Minh", reference_context={has_reference:true, reference_time:"last_month"}
+Plan: [
+  text2sql.query_evidence(query_goal="find_previous_transfer", recipient_hint="Minh", period="last_month", amount=2000000),
+  recipient_resolution.resolve_with_evidence(input_from="step_0")
+]
+Resolution: text2sql generates SELECT → SQLGuardian validates → execute → returns row
+  → RecipientResolution confirms match
+Draft: ActionDraft with full details from history
+Guardian: GREEN
+→ confirm → executed
+```
+
+### Scenario 3: "Chuyển cho người tôi gửi nhiều nhất tháng trước 2 triệu"
+```text
+Extract: action=TRANSFER_MONEY, amount=2000000, recipient_hint=null, reference_context={has_reference:true, reference_type:"previous_recipient", reference_text:"người tôi gửi nhiều nhất tháng trước"}
+Plan: [
+  text2sql.query_evidence(query_goal="find_top_recipient", period="last_month", metric="total_amount"),
+  recipient_resolution.resolve_with_evidence(input_from="step_0")
+]
+Resolution: text2sql → SELECT recipient_account, SUM(amount) ... GROUP BY ... ORDER BY ... LIMIT 1
+  → RecipientResolution verifies account in beneficiaries
+Draft: ActionDraft with resolved recipient
+Guardian: YELLOW (indirect historical reference + medium resolution confidence)
+Friction: OTP
+→ OTP → executed
+```
+
+### Scenario 4: Ambiguous "Minh" — multiple candidates
+```text
+Extract: action=TRANSFER_MONEY, amount=500000, recipient_hint="Minh"
+Plan: [recipient_resolution.resolve_by_name(name="Minh")]
+Resolution: query beneficiaries + transactions → 2 matches:
+  - "Nguyễn Văn Minh" (VCB 012xxx)
+  - "Trần Minh Đức" (TCB 555xxx)
+→ RecipientResolution returns needs_clarification with candidates
+Output: DomainAgentOutput(status="clarification_needed",
+  clarification_message="Tìm thấy 2 người tên Minh. Bạn muốn chuyển cho ai?\n1. Nguyễn Văn Minh - VCB ...2789\n2. Trần Minh Đức - TCB ...5xxx")
+```
+
+### Scenario 5: Recipient linked to scam account
+```text
+Extract: action=TRANSFER_MONEY, amount=50000000, recipient_account="6666666666"
+Plan: [] (account already provided, no resolution needed)
+Draft: ActionDraft(amount=50000000, recipient_account="6666666666")
+Guardian: checks reported_accounts table → RED (scam account + high amount)
+→ BLOCKED. User cannot confirm.
+```
+
+---
+
 ## Phase 1: Server Skeleton
 
-> Goal: Xóa code cũ, server nhận request đúng format, echo lại.
+> Goal: Clean slate, server nhận request đúng format, echo lại.
 
-### Step 1.1: `backend/models.py` — chỉ ChatRequest
+### Step 1.1: `backend/models.py` — ChatRequest + stable ChatResponse envelope
 
-Xóa hết models cũ. Chỉ tạo:
 ```python
 class ChatRequest(BaseModel):
     user_id: str
     message: str
     session_id: str
+
+class ChatResponse(BaseModel):
+    """Stable API contract — fields added once, never removed."""
+    status: str
+    message: str
+    data: dict | None = None
+    pending_action_id: str | None = None
+    action_preview: dict | None = None
+    risk_tier: str | None = None
+    auth_required: str | None = None
 ```
 
-Không có ChatResponse, không có IntentResult, không có gì khác.
+ChatResponse defined early as **API contract**. Not all fields used immediately — unused fields stay None.
 
 **File thay đổi:** `backend/models.py`
 
 ### Step 1.2: `backend/main.py` — echo endpoint
 
 - `/health` giữ nguyên
-- `/chat` nhận `ChatRequest`, print ra terminal, return plain dict:
+- `/chat` nhận `ChatRequest`, return ChatResponse:
   ```python
   @app.post("/chat")
   async def chat(request: ChatRequest):
       print(f"[RECEIVED] user={request.user_id} msg={request.message}")
-      return {"status": "received", "echo": request.message}
+      return ChatResponse(status="received", message=request.message)
   ```
 - Xóa hết import cũ (orchestrator, agents)
 - Không có `/actions/...` endpoint
@@ -48,13 +253,17 @@ Không có ChatResponse, không có IntentResult, không có gì khác.
 uvicorn backend.main:app --reload
 curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
   -d '{"user_id":"u1","message":"Chuyển 2tr cho Minh","session_id":"s1"}'
-# → {"status":"received","echo":"Chuyển 2tr cho Minh"}
+# → {"status":"received","message":"Chuyển 2tr cho Minh","data":null,...}
 ```
 
 ### Step 1.3: Xóa code cũ không dùng
 
+Ensure git commit trước khi xóa. Dùng feature branch:
+```bash
+git checkout -b trustflow-guardian-v2
+```
+
 - Xóa `backend/agents/orchestrator.py` content (giữ file trống hoặc `pass`)
-- Xóa `backend/agents/transaction.py` content
 - Xóa `backend/prompts/intent.py` content
 - Xóa `backend/prompts/transaction.py` content
 - Xóa tests cũ không pass
@@ -67,29 +276,21 @@ curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
 
 > Goal: LLM classify intent, trả kết quả cho user. Chưa route đi đâu cả.
 
-### Step 2.1: Thêm models cần cho phase này
+### Step 2.1: Thêm model IntentResult
 
 **File:** `backend/models.py` — thêm:
 ```python
 class IntentResult(BaseModel):
     task_type: Literal["QA", "DATA_QUERY", "TRANSACTION", "CARD_OPERATION", "ACCOUNT_OPERATION", "LOAN_OPERATION"]
-    operation: Optional[str] = None
-    risk_hint: Literal["LOW", "MEDIUM", "HIGH"]
+    operation: str | None = None
     route: str
     confidence: float
     reason: str
-
-class ChatResponse(BaseModel):
-    status: str
-    message: str
-    data: Optional[dict] = None
 ```
 
 ### Step 2.2: `backend/prompts/intent.py` — classification prompt
 
 Viết prompt để LLM trả về JSON match IntentResult schema.
-
-**Test:** Gọi thử với OpenAI, print raw response.
 
 ### Step 2.3: `backend/agents/orchestrator.py` — classify_intent()
 
@@ -97,12 +298,10 @@ Viết prompt để LLM trả về JSON match IntentResult schema.
 async def classify_intent(message: str) -> IntentResult:
     # gọi LLM với prompt từ step 2.2
     # parse response → IntentResult
-    ...
 ```
 
 ### Step 2.4: Wire vào `/chat`
 
-**File:** `backend/main.py`:
 ```python
 @app.post("/chat")
 async def chat(request: ChatRequest):
@@ -119,114 +318,698 @@ async def chat(request: ChatRequest):
 curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
   -d '{"user_id":"u1","message":"Chuyển 2tr cho Minh","session_id":"s1"}'
 # → {"status":"classified","message":"Intent: TRANSACTION | Operation: TRANSFER_MONEY","data":{...}}
-
-curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
-  -d '{"user_id":"u1","message":"Lãi suất tiết kiệm?","session_id":"s1"}'
-# → {"status":"classified","message":"Intent: QA | Operation: null","data":{...}}
 ```
 
 ---
 
-## Phase 3: TransactionAgent (Domain Agent)
+## Phase 3: Mock Banking Database + TransactionAgent Baseline
 
-> Goal: Nếu intent=TRANSACTION → TransactionAgent parse entity + resolve recipient → trả draft.
+> Goal: Tạo banking.db realistic, TransactionAgent extract + hardcoded recipient resolution → draft.
+> Hardcoded flow trước để có baseline chạy được. Phase 6 refactor sang dynamic planning.
 
-### Step 3.1: Thêm models cần cho phase này
+### Step 3.1: Thêm typed extraction + draft models
 
 **File:** `backend/models.py` — thêm:
 ```python
+class TransactionExtraction(BaseModel):
+    """Typed extraction from user message — core banking entity parsing."""
+    action: Literal["TRANSFER_MONEY", "BILL_PAYMENT", "TOP_UP", "UNKNOWN"]
+    amount: int | None = None
+    currency: str = "VND"
+    recipient_hint: str | None = None
+    recipient_account: str | None = None
+    recipient_bank: str | None = None
+    bill_provider: str | None = None
+    customer_code: str | None = None
+    topup_target: str | None = None
+    source_account_hint: str | None = None
+    purpose_hint: str | None = None
+    note: str | None = None
+    reference_context: dict | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+    resolvable_fields: list[str] = Field(default_factory=list)
+    needs_clarification: bool = False
+    clarification_reason: str | None = None
+    confidence: float = 0.0
+
+class ActionDraft(BaseModel):
+    """Typed draft for Guardian input — never raw dict at boundaries."""
+    action_type: str          # "TRANSACTION", "CARD_OPERATION"
+    operation: str            # "TRANSFER_MONEY", "LOCK_CARD"
+    amount: int | None = None
+    currency: str = "VND"
+    recipient_name: str | None = None
+    recipient_account: str | None = None
+    recipient_bank: str | None = None
+    note: str | None = None
+    resolution_source: str | None = None       # "saved_beneficiary", "transaction_history", "text2sql_evidence"
+    resolution_confidence: float | None = None  # 0.95 (beneficiary), 0.8 (history), 0.75 (text2sql)
+
 class AgentTask(BaseModel):
+    """Generic task request from domain agent to sub-agent."""
     task_type: str
     context: dict = Field(default_factory=dict)
     constraints: dict = Field(default_factory=dict)
-    allowed_output: list[str] = Field(default_factory=list)
 
 class AgentTaskResult(BaseModel):
+    """Generic task response from sub-agent back to domain agent."""
     status: Literal["success", "failed", "needs_clarification"]
     result: dict = Field(default_factory=dict)
     confidence: float = 1.0
 
 class DomainAgentOutput(BaseModel):
+    """Standard output of any domain agent."""
     status: Literal["draft_ready", "clarification_needed", "info_response"]
-    action_draft: Optional[dict] = None
-    clarification_message: Optional[str] = None
-    info_response: Optional[str] = None
+    action_draft: ActionDraft | None = None
+    clarification_message: str | None = None
+    info_response: str | None = None
     delegation_trace: list[str] = Field(default_factory=list)
 ```
 
-### Step 3.2: Create mock data
+### Step 3.2: Create banking.db + seed script
 
-- `backend/data/beneficiaries.json` — tạo lúc này vì BeneficiaryAgent cần
+**File:** `backend/data/seed_banking_db.py`
+
+Creates SQLite database with schema (users, accounts, beneficiaries, transactions, reported_accounts) and seeds realistic data:
+- 2 users (u1, u2)
+- 2-3 accounts per user
+- 3-5 saved beneficiaries per user (with nicknames JSON array)
+- 50-100 transactions spanning 3 months (varied categories, amounts, recipients)
+- 3-5 reported/scam accounts
+
+**File output:** `backend/data/banking.db`
+
+```bash
+# Run once:
+python -m backend.data.seed_banking_db
+sqlite3 backend/data/banking.db "SELECT COUNT(*) FROM transactions;"
+# → 50+
+sqlite3 backend/data/banking.db "SELECT name, nicknames FROM beneficiaries WHERE user_id='u1';"
+# → shows saved beneficiaries with nicknames
+```
 
 ### Step 3.3: `backend/prompts/transaction.py` — extraction prompt
 
-LLM extract: action, amount, recipient_hint, recipient_account, recipient_bank, note, missing_fields.
+LLM extract → `TransactionExtraction` (typed). Prompt đã có sẵn, ensure output matches model schema. Add user template.
 
-**Test:** Gọi LLM, print parsed result.
+**Test:** Gọi LLM, parse vào TransactionExtraction model.
 
-### Step 3.4: `backend/agents/sub_agents/beneficiary.py`
+### Step 3.4: `backend/agents/sub_agents/recipient_resolution.py` (Phase 3 version)
+
+Phase 3 version: **direct DB queries only** (no Text2SQL, no LLM).
 
 ```python
-class BeneficiaryAgent:
+class RecipientResolutionAgent:
+    """Resolves recipient_hint to verified recipient candidate(s).
+
+    Data sources (direct SQL, no LLM):
+    1. beneficiaries table — saved recipients with nicknames
+    2. transactions table — historical recipients (fallback)
+
+    Outcomes:
+    - 1 match → success (verified candidate)
+    - 0 matches → needs_clarification
+    - 2+ matches → needs_clarification with candidates list
+    """
+
     async def execute_task(self, task: AgentTask) -> AgentTaskResult:
-        # load beneficiaries.json
-        # match name/nickname
-        # return candidates
+        if task.task_type == "resolve_by_name":
+            return self._resolve_by_name(task)
+        elif task.task_type == "resolve_by_account":
+            return self._resolve_by_account(task)
+
+    def _resolve_by_name(self, task: AgentTask) -> AgentTaskResult:
+        """
+        1. Query beneficiaries WHERE user_id=? AND (name LIKE ? OR nicknames LIKE ?)
+        2. If 0 results → query transactions for DISTINCT recipients matching name
+        3. Deduplicate by account_number
+        4. Return candidates
+        """
+        user_id = task.constraints["user_id"]
+        name = task.constraints["name"]
+        # ... structured SQL queries against banking.db ...
+
+    def _resolve_by_account(self, task: AgentTask) -> AgentTaskResult:
+        """Exact match by account number in beneficiaries or transaction history."""
+        ...
 ```
 
 Tạo `backend/agents/sub_agents/__init__.py`.
 
 **Test:**
 ```python
-result = await agent.execute_task(AgentTask(task_type="resolve_by_name", constraints={"name":"Minh","user_id":"u1"}))
-assert result.result["account"] == "0123456789"
+result = await agent.execute_task(AgentTask(
+    task_type="resolve_by_name",
+    constraints={"name": "Minh", "user_id": "u1"}
+))
+assert result.status == "success"
+assert result.result["account_number"] == "0123456789"
 ```
 
-### Step 3.5: `backend/agents/transaction.py` — TransactionAgent.run()
+### Step 3.5: `backend/agents/transaction.py` — TransactionAgent.run() (hardcoded baseline)
 
 ```python
 class TransactionAgent:
+    """Domain agent for TRANSACTION intent.
+    Phase 3: hardcoded resolution flow.
+    Phase 6: refactored to dynamic planning.
+    """
+
     async def run(self, message: str, user_id: str, session_id: str) -> DomainAgentOutput:
-        # 1. LLM extract
-        # 2. If missing recipient_account → BeneficiaryAgent
-        # 3. If 0 match → clarification_needed
-        # 4. If 1 match → build draft
-        # 5. Return DomainAgentOutput
+        trace = []
+
+        # 1. LLM extract → TransactionExtraction (typed)
+        extraction = await self._extract_entities(message)
+        trace.append("extract_entities")
+
+        # 2. Early exit if extraction needs clarification
+        if extraction.needs_clarification:
+            return DomainAgentOutput(status="clarification_needed", ...)
+
+        # 3. Resolve recipient (hardcoded — Phase 6 replaces with planning)
+        if extraction.recipient_hint and not extraction.recipient_account:
+            result = await self.recipient_agent.execute_task(
+                AgentTask(task_type="resolve_by_name",
+                          constraints={"name": extraction.recipient_hint, "user_id": user_id})
+            )
+            trace.append("resolve_recipient")
+            if result.status == "success":
+                # merge resolved data into extraction
+                ...
+            elif result.status == "needs_clarification":
+                return DomainAgentOutput(status="clarification_needed", clarification_message=result.result["message"])
+
+        # 4. Validate required fields (amount, recipient)
+        if not extraction.amount:
+            return DomainAgentOutput(status="clarification_needed", clarification_message="Bạn muốn chuyển bao nhiêu?")
+        if not extraction.recipient_account and not extraction.recipient_hint:
+            return DomainAgentOutput(status="clarification_needed", clarification_message="Bạn muốn chuyển cho ai?")
+
+        # 5. Build typed ActionDraft
+        draft = ActionDraft(action_type="TRANSACTION", operation=extraction.action, ...)
+        trace.append("build_draft")
+
+        return DomainAgentOutput(status="draft_ready", action_draft=draft, delegation_trace=trace)
 ```
 
-### Step 3.6: Wire vào `/chat`
+### Step 3.6: Wire vào `/chat` via thin DomainAgentRouter
 
-**File:** `backend/main.py` — sau classify_intent:
+**File:** `backend/main.py`:
 ```python
-if intent.task_type == "TRANSACTION":
-    agent_output = await transaction_agent.run(request.message, request.user_id, request.session_id)
-    return ChatResponse(
-        status=agent_output.status,
-        message=agent_output.clarification_message or "Draft ready",
-        data=agent_output.action_draft
-    )
-else:
-    return ChatResponse(status="classified", message=f"Intent: {intent.task_type}", data=intent.model_dump())
+DOMAIN_AGENT_MAP = {
+    "TRANSACTION": transaction_agent,
+}
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    intent = await classify_intent(request.message)
+    agent = DOMAIN_AGENT_MAP.get(intent.task_type)
+    if agent:
+        output = await agent.run(request.message, request.user_id, request.session_id)
+        return ChatResponse(
+            status=output.status,
+            message=output.clarification_message or "Draft ready",
+            data=output.action_draft.model_dump() if output.action_draft else None,
+        )
+    else:
+        return ChatResponse(status="classified", message=f"Intent: {intent.task_type}", data=intent.model_dump())
 ```
 
 **Test:**
 ```bash
+# Scenario 1: known recipient → draft_ready
 curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
   -d '{"user_id":"u1","message":"Chuyển 2tr cho Minh tiền ăn trưa","session_id":"s1"}'
-# → {"status":"draft_ready","message":"Draft ready","data":{"action":"TRANSFER_MONEY","amount":2000000,"recipient_name":"Nguyễn Văn Minh",...}}
+# → {"status":"draft_ready","data":{"operation":"TRANSFER_MONEY","amount":2000000,"recipient_name":"Nguyễn Văn Minh",...}}
 
+# Missing recipient → clarification
 curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
   -d '{"user_id":"u1","message":"Chuyển 5 triệu","session_id":"s1"}'
-# → {"status":"clarification_needed","message":"Bạn muốn chuyển cho ai?","data":null}
+# → {"status":"clarification_needed","message":"Bạn muốn chuyển cho ai?"}
+
+# Ambiguous → clarification with candidates (Scenario 4)
+curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
+  -d '{"user_id":"u1","message":"Chuyển 500k cho Minh","session_id":"s1"}'
+# → {"status":"clarification_needed","message":"Tìm thấy 2 người tên Minh..."}
+# (depends on seed data having 2 "Minh" entries)
 ```
 
 ---
 
-## Phase 4: Guardian + Friction + Session
+## Phase 4: RecipientResolutionAgent Core
 
-> Goal: Draft từ Phase 3 giờ đi qua Guardian → xác định risk → tạo PendingAction. User thấy được risk tier.
+> Goal: Add `resolve_with_evidence` task_type to RecipientResolutionAgent.
+> This phase only adds deterministic resolution capabilities. Historical/analytical queries
+> ("người tôi gửi nhiều nhất", "như tháng trước") are handled by Text2SQL in Phase 5/6.
 
-### Step 4.1: Thêm models cần cho phase này
+### Step 4.1: Add resolve_with_evidence task_type
+
+```python
+class RecipientResolutionAgent:
+    """
+    Supported task_types:
+    - resolve_by_name: beneficiaries + transaction history name match (Phase 3)
+    - resolve_by_account: exact account match (Phase 3)
+    - resolve_with_evidence: inspect upstream evidence rows and verify (NEW)
+
+    Auto-resolve rule:
+    - Exactly 1 high-confidence verified candidate → auto-resolve (success)
+    - Multiple plausible candidates → needs_clarification with candidate list
+    - 0 candidates → needs_clarification
+    """
+
+    def _resolve_with_evidence(self, task: AgentTask) -> AgentTaskResult:
+        """Inspect evidence rows from upstream step (Text2SQL).
+        Verifies account in beneficiaries or past transactions for this user.
+
+        constraints: {user_id, evidence_rows: [...]}
+
+        Logic:
+        1. Extract account_number/recipient_name from evidence rows
+        2. Verify account exists in beneficiaries or past transactions for this user
+        3. If exactly 1 verified match → success
+        4. If multiple or unverified → needs_clarification
+        """
+        ...
+```
+
+### Step 4.2: Test resolution paths
+
+```python
+# Test: resolve_by_name → single match → auto-resolve
+# Test: resolve_by_name → multiple candidates → clarification (Scenario 4)
+# Test: resolve_by_account → exact match
+# Test: resolve_by_account → not found → clarification
+# Test: resolve_with_evidence → valid evidence → success
+# Test: resolve_with_evidence → unverified evidence → clarification
+```
+
+**Test:**
+```bash
+# Phase 4 does not change /chat behavior yet.
+# RecipientResolutionAgent gains resolve_with_evidence for Phase 5/6 to use.
+pytest tests/test_recipient_resolution.py -v
+```
+
+---
+
+## Phase 5: Text2SQLAgent — Constrained Evidence Retrieval
+
+> Goal: Add Text2SQLAgent as optional evidence sub-agent for complex queries that
+> structured code alone can't handle well. Constrained SELECT only.
+
+### Step 5.1: `backend/agents/sub_agents/text2sql.py`
+
+```python
+class Text2SQLAgent:
+    """Evidence retrieval sub-agent. Generates constrained SELECT queries.
+
+    ALLOWED:
+    - SELECT queries against allowlisted tables
+    - WHERE clause must include user_id filter
+    - Must have LIMIT clause
+    - Aggregations (SUM, COUNT, AVG, MAX, MIN)
+    - GROUP BY, ORDER BY, JOINs between allowed tables
+
+    FORBIDDEN:
+    - INSERT, UPDATE, DELETE, DROP, ALTER, CREATE
+    - Queries without user_id scope
+    - Queries without LIMIT
+    - Subqueries referencing non-allowed tables
+    - Any action/execution language
+
+    Flow: natural language → LLM → SQL → SQLGuardian → SQLExecutor → evidence rows
+    """
+
+    async def execute_task(self, task: AgentTask) -> AgentTaskResult:
+        """
+        task_type: "query_evidence"
+        constraints: {
+            "query_goal": str,        # e.g. "find_previous_transfer", "find_top_recipient"
+            "user_id": str,           # injected by PlanExecutor from backend context
+            "recipient_hint": str | None,
+            "period": str | None,     # "last_month", "last_week", etc.
+            "metric": str | None,     # "total_amount", "frequency"
+            "amount": int | None
+        }
+
+        1. Build structured prompt from query_goal + constraints (not free-form question)
+        2. Generate SQL via LLM (strict system prompt)
+        3. SQLGuardian.validate(sql, user_id) — reject if invalid
+        4. SQLExecutor.execute(validated_sql, params) — user_id injected from backend context
+        5. Return {"sql": str, "params": dict, "rows": list, "explanation": str} for auditability
+        """
+        ...
+```
+
+### Step 5.2: `backend/services/sql_guardian.py`
+
+```python
+class SQLGuardian:
+    """Validates LLM-generated SQL before execution.
+
+    Checks:
+    1. Statement type is SELECT only (parse first token / use sqlparse)
+    2. Tables referenced are in allowlist: {users, accounts, beneficiaries, transactions}
+    3. WHERE clause contains user_id = :user_id (parameterized)
+    4. LIMIT clause present (max 100)
+    5. No dangerous functions (LOAD_FILE, INTO OUTFILE, etc.)
+    6. No UNION with non-allowed tables
+
+    Returns: (validated_sql, params) or raises SQLValidationError
+    """
+
+    ALLOWED_TABLES = {"users", "accounts", "beneficiaries", "transactions"}
+    MAX_LIMIT = 100
+
+    def validate(self, sql: str, user_id: str) -> tuple[str, dict]:
+        ...
+```
+
+### Step 5.3: `backend/services/sql_executor.py`
+
+```python
+class SQLExecutor:
+    """Executes validated SQL against banking.db.
+
+    Security:
+    - Only accepts SQL that passed SQLGuardian
+    - Injects user_id from backend context (task.constraints["user_id"])
+    - NEVER uses user_id from LLM output
+    - Returns results as list[dict]
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+    def execute(self, sql: str, params: dict) -> list[dict]:
+        # params["user_id"] always comes from backend auth context
+        ...
+```
+
+### Step 5.4: `backend/prompts/text2sql.py`
+
+```text
+You are not answering the user directly.
+You generate SQL only for the query_goal provided by the transaction planner.
+Use the structured fields (recipient_hint, period, metric, amount) as query constraints.
+Do not infer user_id — it will be injected by the system.
+Do not infer execution intent — you are only retrieving evidence.
+
+RULES:
+- Generate SELECT statements ONLY. No INSERT, UPDATE, DELETE, DROP, ALTER, CREATE.
+- ALWAYS include WHERE user_id = :user_id
+- ALWAYS include LIMIT (max 100)
+- Available tables: users, accounts, beneficiaries, transactions
+- Available columns: [full schema listing]
+- Use query_goal and structured constraints to build precise SQL.
+
+Return JSON:
+{
+  "sql": "SELECT ... FROM ... WHERE user_id = :user_id AND ... LIMIT ...",
+  "explanation": "brief explanation of what this query finds"
+}
+```
+
+### Step 5.5: Register Text2SQLAgent
+
+Not yet wired into TransactionAgent (that's Phase 6).
+Registered in AgentRegistry for availability.
+
+```python
+registry.register("text2sql", Text2SQLAgent(sql_guardian, sql_executor))
+```
+
+### Step 5.6: Test Text2SQL pipeline in isolation
+
+```python
+# Test: structured goal → valid SQL → returns rows
+task = AgentTask(task_type="query_evidence", constraints={
+    "query_goal": "find_top_recipient",
+    "period": "last_month",
+    "metric": "total_amount",
+    "user_id": "u1"
+})
+result = await text2sql_agent.execute_task(task)
+assert result.status == "success"
+assert "rows" in result.result
+
+# Test: find previous transfer
+task = AgentTask(task_type="query_evidence", constraints={
+    "query_goal": "find_previous_transfer",
+    "recipient_hint": "Minh",
+    "period": "last_month",
+    "user_id": "u1"
+})
+result = await text2sql_agent.execute_task(task)
+assert result.status == "success"
+
+# Test: SQLGuardian rejects DELETE statement
+# Test: SQLGuardian rejects query without user_id
+# Test: SQLGuardian rejects query without LIMIT
+# Test: SQLGuardian rejects non-allowed table
+```
+
+---
+
+## Phase 6: Dynamic Planning Inside TransactionAgent
+
+> Goal: Refactor TransactionAgent from hardcoded if/else to LLM-generated resolution plan.
+> This is the core agentic layer — proves agent-to-agent autonomous orchestration.
+>
+> **MVP scope:** Planner only needs to support 3 planning patterns:
+> 1. Direct name → `recipient_resolution.resolve_by_name`
+> 2. Direct account → `recipient_resolution.resolve_by_account`
+> 3. Historical reference → `text2sql.query_evidence` → `recipient_resolution.resolve_with_evidence`
+>
+> Do not over-engineer a generic planner. These 3 patterns are sufficient to prove agent-to-agent.
+
+### Step 6.1: Planning models
+
+**File:** `backend/models.py` — thêm:
+```python
+class PlanStep(BaseModel):
+    agent: str                        # registry key: "recipient_resolution", "text2sql"
+    task_type: str                    # "resolve_by_name", "query_evidence", etc.
+    input_from: str | None = None     # "extraction" | "step_0" | "step_1"
+    constraints: dict = Field(default_factory=dict)
+    reason: str                       # why this step is needed
+
+class AgentPlan(BaseModel):
+    steps: list[PlanStep] = Field(default_factory=list)
+    fallback: Literal["clarify", "proceed_partial"] = "clarify"
+    confidence: float = 0.0
+```
+
+### Step 6.2: Agent Registry
+
+**File:** `backend/agents/registry.py`
+
+```python
+class AgentRegistry:
+    def __init__(self):
+        self._agents: dict[str, Any] = {}
+
+    def register(self, name: str, agent: Any):
+        self._agents[name] = agent
+
+    def get(self, name: str) -> Any:
+        return self._agents.get(name)
+
+    def available(self) -> list[str]:
+        return list(self._agents.keys())
+```
+
+Register:
+```python
+registry = AgentRegistry()
+registry.register("recipient_resolution", RecipientResolutionAgent())
+registry.register("text2sql", Text2SQLAgent(sql_guardian, sql_executor))
+```
+
+### Step 6.3: Planning prompt
+
+**File:** `backend/prompts/planning.py`
+
+```text
+You are a RESOLUTION planner for banking transactions.
+
+Given:
+- extraction result (fields already known from user message)
+- available sub-agents and their capabilities
+- user_id for scoping queries
+
+Generate a resolution plan to fill missing or referenced information ONLY.
+
+RULES:
+1. Only generate RESOLUTION steps: resolve recipient, lookup history, query evidence, verify account.
+2. NEVER generate EXECUTION steps: transfer_money, send_otp, approve, bypass_guardian, execute, confirm.
+3. Only use agents from the provided allowlist.
+4. Maximum 5 steps.
+5. If ALL required fields are already present, return empty plan: {"steps": [], "confidence": 1.0}
+6. Each step must have a "reason" explaining why it's needed.
+7. Prefer deterministic RecipientResolutionAgent for direct name/account resolution.
+8. Use Text2SQLAgent ONLY when the user refers to historical or analytical banking data
+   (e.g. "last month", "most transferred", "last time", "same as before", spending history).
+9. If recipient_hint is present and NO reference_context → use recipient_resolution.resolve_by_name
+10. If reference_context exists with time/history reference → text2sql.query_evidence then recipient_resolution.resolve_with_evidence
+11. If account is provided but name unknown → use recipient_resolution.resolve_by_account
+
+Available agents:
+{available_agents_description}
+
+Extraction context:
+{extraction_json}
+```
+
+### Step 6.4: Plan Validator
+
+**File:** `backend/services/plan_validator.py`
+
+```python
+EXECUTION_BLOCKLIST = {
+    "transfer_money", "execute_transfer", "send_otp",
+    "approve_transaction", "bypass_guardian", "execute",
+    "confirm", "block", "unblock", "send_money",
+}
+
+ALLOWED_TASKS_PER_AGENT = {
+    "recipient_resolution": {"resolve_by_name", "resolve_by_account", "resolve_with_evidence"},
+    "text2sql": {"query_evidence"},
+}
+
+class PlanValidator:
+    def validate(self, plan: AgentPlan, allowed_agents: set[str]) -> AgentPlan:
+        if len(plan.steps) > 5:
+            raise PlanValidationError("Plan exceeds max 5 steps")
+        for i, step in enumerate(plan.steps):
+            if step.agent not in allowed_agents:
+                raise PlanValidationError(f"Agent '{step.agent}' not in allowlist: {allowed_agents}")
+            if step.task_type.lower() in EXECUTION_BLOCKLIST:
+                raise PlanValidationError(f"Execution task_type '{step.task_type}' forbidden in resolution plan")
+            # Validate task_type is allowed for this specific agent
+            allowed_tasks = ALLOWED_TASKS_PER_AGENT.get(step.agent, set())
+            if allowed_tasks and step.task_type not in allowed_tasks:
+                raise PlanValidationError(f"task_type '{step.task_type}' not allowed for agent '{step.agent}'. Allowed: {allowed_tasks}")
+            if step.input_from == f"step_{i}":
+                raise PlanValidationError(f"Circular reference: step_{i} references itself")
+        return plan
+```
+
+### Step 6.5: Plan Executor
+
+**File:** `backend/services/plan_executor.py`
+
+```python
+class PlanExecutor:
+    def __init__(self, registry: AgentRegistry):
+        self.registry = registry
+
+    async def execute(self, plan: AgentPlan, context: dict) -> dict[str, AgentTaskResult]:
+        results = {}
+        for i, step in enumerate(plan.steps):
+            agent = self.registry.get(step.agent)
+            if not agent:
+                results[f"step_{i}"] = AgentTaskResult(status="failed", result={"error": f"Agent '{step.agent}' not found"})
+                continue
+
+            # Build constraints: merge step constraints + user_id from context
+            task_constraints = {**step.constraints, "user_id": context["user_id"]}
+
+            # Chain: if input_from references previous step, merge its result
+            if step.input_from and step.input_from.startswith("step_"):
+                prev = results.get(step.input_from)
+                if prev and prev.status == "success":
+                    task_constraints["evidence_rows"] = prev.result.get("rows", [])
+                    task_constraints.update(prev.result)
+
+            task = AgentTask(task_type=step.task_type, constraints=task_constraints)
+            results[f"step_{i}"] = await agent.execute_task(task)
+        return results
+```
+
+### Step 6.6: Domain agent allowlist
+
+```python
+TRANSACTION_ALLOWED_AGENTS = {
+    "recipient_resolution",
+    "text2sql",
+}
+```
+
+TransactionAgent CANNOT call: executor, guardian, card_resolver.
+
+### Step 6.7: Refactor TransactionAgent.run()
+
+```python
+class TransactionAgent:
+    async def run(self, message: str, user_id: str, session_id: str) -> DomainAgentOutput:
+        trace = []
+
+        # 1. Extract
+        extraction = await self._extract_entities(message)
+        trace.append("extract_entities")
+
+        if extraction.needs_clarification:
+            return DomainAgentOutput(status="clarification_needed", ...)
+
+        # 2. Generate resolution plan (LLM)
+        plan = await self._generate_plan(extraction)
+        trace.append("generate_plan")
+
+        # 3. Validate plan (fixed safety)
+        plan = self.plan_validator.validate(plan, TRANSACTION_ALLOWED_AGENTS)
+        trace.append("validate_plan")
+
+        # 4. Execute plan (dynamic)
+        if plan.steps:
+            results = await self.plan_executor.execute(plan, {"user_id": user_id, "extraction": extraction.model_dump()})
+            trace.append("execute_plan")
+            extraction = self._merge_results(extraction, results)
+
+        # 5. Check if resolution succeeded — still missing required fields?
+        if self._still_missing_required(extraction):
+            return DomainAgentOutput(status="clarification_needed", clarification_message=self._missing_message(extraction))
+
+        # 6. Build ActionDraft
+        draft = self._build_draft(extraction)
+        trace.append("build_draft")
+
+        return DomainAgentOutput(status="draft_ready", action_draft=draft, delegation_trace=trace)
+```
+
+### Step 6.8: Test all 5 scenarios with dynamic planning
+
+```bash
+# Scenario 1: "Chuyển 2tr cho Minh"
+# Plan: [recipient_resolution.resolve_by_name(name="Minh")]
+# → draft_ready
+# delegation_trace: [extract_entities, generate_plan, validate_plan, execute_plan, build_draft]
+
+# Scenario 2: "Chuyển cho Minh 2 triệu như tháng trước"
+# Plan: [text2sql.query_evidence(...), recipient_resolution.resolve_with_evidence(input_from=step_0)]
+# → draft_ready
+
+# Scenario 3: "Chuyển cho người tôi gửi nhiều nhất tháng trước 2 triệu"
+# Plan: [text2sql.query_evidence(find top recipient), recipient_resolution.resolve_with_evidence(input_from=step_0)]
+# → draft_ready
+
+# Scenario 4: Ambiguous "Minh"
+# Plan: [recipient_resolution.resolve_by_name(name="Minh")]
+# → clarification_needed (multiple candidates)
+
+# All Phase 3/4 test cases still pass (no regression)
+pytest tests/ -v
+```
+
+---
+
+## Phase 7: Guardian + Friction + PendingAction + Minimal Audit
+
+> Goal: Every ActionDraft goes through Guardian → risk tier → Friction → PendingAction.
+> Minimal structured audit logging starts here.
+
+### Step 7.1: Thêm models
 
 **File:** `backend/models.py` — thêm:
 ```python
@@ -247,76 +1030,146 @@ class PendingAction(BaseModel):
     action_type: str
     operation: str
     executor_type: str
-    draft: dict
+    draft: dict              # serialized ActionDraft
     risk_tier: str
     auth_required: str
     created_at: str
     executed: bool = False
 ```
 
-### Step 4.2: Tạo `backend/data/reported_accounts.json`
+### Step 7.2: `backend/services/guardian.py`
 
-Tạo lúc này vì Guardian cần.
+Guardian.evaluate() nhận **typed ActionDraft** + queries `reported_accounts` from banking.db:
 
-### Step 4.3: `backend/services/guardian.py`
-
-Guardian.evaluate() — hard rules + soft scoring → GuardianDecision.
-
-**Test:**
 ```python
-decision = guardian.evaluate({"recipient_account": "6666666666", "amount": 5000000}, "u1", "...")
-assert decision.decision == "BLOCK"
-assert decision.risk_tier == "RED"
+class Guardian:
+    """Deterministic risk assessment. No LLM involved.
+
+    Hard rules (instant BLOCK / RED):
+    - recipient_account in reported_accounts → RED
+    - amount > 100,000,000 VND → RED
+
+    Soft scoring (additive):
+    - amount > 50,000,000 → +0.3
+    - recipient not in user's beneficiaries → +0.2
+    - first-time recipient + high amount → +0.3
+    - unusual time (2am-5am) → +0.1
+    - amount > 3x user's average transfer → +0.2
+    - resolution_confidence < 0.8 → +0.2
+    - resolution_source == "text2sql_evidence" (indirect reference) → +0.15
+
+    Tier mapping:
+    - score < 0.2 → GREEN
+    - 0.2 ≤ score < 0.5 → YELLOW
+    - 0.5 ≤ score < 0.8 → ORANGE
+    - score ≥ 0.8 or hard rule → RED
+    """
+
+    def evaluate(self, draft: ActionDraft, user_id: str, session_id: str) -> GuardianDecision:
+        ...
 ```
 
-### Step 4.4: `backend/services/friction.py`
+### Step 7.3: `backend/services/friction.py`
 
-FrictionRouter.route(decision) → FrictionResult.
-
-**Test:** Unit test 4 tiers.
-
-### Step 4.5: `backend/services/session.py`
-
-SessionStore: store_pending(), get_pending(), mark_executed().
-
-**Test:** Store → get → verify fields.
-
-### Step 4.6: `backend/services/agent_runtime.py`
-
-AgentRuntime.process():
-- clarification_needed → pass through
-- draft_ready → Guardian → Friction → SessionStore → return pending_auth
-
-### Step 4.7: Wire vào `/chat`
-
-**File:** `backend/main.py` — thay thế logic Phase 3:
 ```python
-if intent.task_type == "TRANSACTION":
-    agent_output = await transaction_agent.run(request.message, request.user_id, request.session_id)
-    response = await agent_runtime.process(agent_output, request, intent)
-    return response
+FRICTION_MAP = {
+    "GREEN": FrictionResult(auth_type="bank_confirm", message="Xác nhận giao dịch"),
+    "YELLOW": FrictionResult(auth_type="otp", message="Nhập mã OTP để xác nhận"),
+    "ORANGE": FrictionResult(auth_type="challenge", message="Trả lời câu hỏi bảo mật"),
+    "RED": FrictionResult(auth_type="blocked", message="Giao dịch bị từ chối vì lý do bảo mật"),
+}
 ```
 
-Cập nhật ChatResponse thêm fields cần thiết:
+### Step 7.4: `backend/services/session.py`
+
 ```python
-class ChatResponse(BaseModel):
-    status: str
-    message: str
-    data: Optional[dict] = None
-    pending_action_id: Optional[str] = None
-    action_preview: Optional[dict] = None
-    risk_tier: Optional[str] = None
-    auth_required: Optional[str] = None
+# MVP: in-memory dict. Single worker (uvicorn --workers 1).
+# Production: Redis or Postgres.
+class SessionStore:
+    def store_pending(self, action: PendingAction) -> None: ...
+    def get_pending(self, action_id: str) -> PendingAction | None: ...
+    def mark_executed(self, action_id: str) -> None: ...
+```
+
+### Step 7.5: `backend/services/agent_runtime.py`
+
+```python
+class AgentRuntime:
+    """Fixed control plane: DomainAgentOutput → Guardian → Friction → PendingAction → Response"""
+
+    async def process(self, agent_output: DomainAgentOutput, request: ChatRequest, intent: IntentResult) -> ChatResponse:
+        # clarification → pass through
+        if agent_output.status == "clarification_needed":
+            return ChatResponse(status="clarification_needed", message=agent_output.clarification_message)
+
+        # info_response → pass through
+        if agent_output.status == "info_response":
+            return ChatResponse(status="completed", message=agent_output.info_response)
+
+        # draft_ready → Guardian → Friction → PendingAction
+        draft = agent_output.action_draft
+        decision = self.guardian.evaluate(draft, request.user_id, request.session_id)
+
+        if decision.decision == "BLOCK":
+            self._log_trace(request, intent, draft, decision, None, "blocked")
+            return ChatResponse(status="blocked", message=decision.reasons[0] if decision.reasons else "Giao dịch bị từ chối.", risk_tier=decision.risk_tier)
+
+        friction = self.friction_router.route(decision)
+        pending = PendingAction(action_id=str(uuid4()), ...)
+        self.session_store.store_pending(pending)
+        self._log_trace(request, intent, draft, decision, friction, "pending_auth")
+
+        return ChatResponse(
+            status="pending_auth",
+            pending_action_id=pending.action_id,
+            action_preview=draft.model_dump(),
+            risk_tier=decision.risk_tier,
+            auth_required=friction.auth_type,
+            message=friction.message,
+        )
+```
+
+### Step 7.6: Minimal audit logging
+
+```python
+# backend/services/audit.py
+import logging
+logger = logging.getLogger("trustflow.audit")
+
+def log_request_trace(request_id, user_id, intent, draft, guardian_decision, friction_result, final_status):
+    logger.info("AUDIT_TRACE", extra={
+        "request_id": request_id,
+        "user_id": user_id,
+        "intent": intent,
+        "draft": draft,
+        "guardian_decision": guardian_decision,
+        "friction_result": friction_result,
+        "final_status": final_status,
+    })
+```
+
+### Step 7.7: Wire vào `/chat`
+
+```python
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    intent = await classify_intent(request.message)
+    agent = DOMAIN_AGENT_MAP.get(intent.task_type)
+    if agent:
+        output = await agent.run(request.message, request.user_id, request.session_id)
+        return await agent_runtime.process(output, request, intent)
+    else:
+        return ChatResponse(status="classified", message=f"Intent: {intent.task_type}", data=intent.model_dump())
 ```
 
 **Test:**
 ```bash
-# GREEN — known recipient, low amount
+# Scenario 1: GREEN
 curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
   -d '{"user_id":"u1","message":"Chuyển 2tr cho Minh tiền ăn trưa","session_id":"s1"}'
-# → {"status":"pending_auth","risk_tier":"GREEN","auth_required":"bank_confirm","pending_action_id":"...","action_preview":{...}}
+# → {"status":"pending_auth","risk_tier":"GREEN","auth_required":"bank_confirm","pending_action_id":"..."}
 
-# RED — scam account
+# Scenario 5: RED — scam account
 curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
   -d '{"user_id":"u1","message":"Chuyển 50tr vào 6666666666","session_id":"s1"}'
 # → {"status":"blocked","risk_tier":"RED","message":"..."}
@@ -324,226 +1177,164 @@ curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
 
 ---
 
-## Phase 5: Executor + Confirm/OTP Endpoints
+## Phase 8: Confirm/OTP Endpoints + Executor
 
-> Goal: User confirm/OTP pending action → execute. Lúc này mới tạo endpoint mới.
+> Goal: User confirm/OTP pending action → execute.
 
-### Step 5.1: Thêm models cần cho phase này
+### Step 8.1: Thêm models
 
-**File:** `backend/models.py` — thêm:
+**File:** `backend/models.py`:
 ```python
 class ConfirmRequest(BaseModel):
     user_id: str
+    session_id: str | None = None
+    # Demo only: user_id from body. Production: from JWT.
 
 class OTPRequest(BaseModel):
     user_id: str
     otp_code: str
+    session_id: str | None = None
 
 class ActionResponse(BaseModel):
     status: Literal["executed", "failed"]
     message: str
-    execution_id: Optional[str] = None
+    execution_id: str | None = None
 ```
 
-### Step 5.2: `backend/executors/__init__.py` + `backend/executors/transaction.py`
+### Step 8.2: `backend/executors/transaction.py`
 
-Tạo folder + TransactionExecutor (mock: always succeed).
+TransactionExecutor (mock: always succeed, log details).
 
-### Step 5.3: `POST /actions/{action_id}/confirm`
+### Step 8.3: Endpoints
 
-**File:** `backend/main.py` — thêm endpoint:
-- Load pending → verify user + auth_type == "bank_confirm" → execute → mark_executed
+```python
+@app.post("/actions/{action_id}/confirm")
+async def confirm_action(action_id: str, req: ConfirmRequest):
+    # Load pending → verify user_id → verify auth_type == "bank_confirm"
+    # → execute → mark_executed → audit log → return ActionResponse
 
-### Step 5.4: `POST /actions/{action_id}/otp`
+@app.post("/actions/{action_id}/otp")
+async def otp_action(action_id: str, req: OTPRequest):
+    # Load pending → verify user_id → verify OTP ("123456" for demo)
+    # → execute → mark_executed → audit log → return ActionResponse
+```
 
-**File:** `backend/main.py` — thêm endpoint:
-- Load pending → verify user + OTP ("123456") → execute → mark_executed
+### Step 8.4: Error handling
 
-### Step 5.5: Error handling
-
-- 404: not found
-- 401: user mismatch
-- 403: wrong auth type / blocked
+- 404: action not found
+- 401: user_id mismatch
+- 403: wrong auth type / action was blocked
 - 409: already executed
 
 **Test:**
 ```bash
-# Full flow: chat → get action_id → confirm
+# Full lifecycle: chat → confirm
 curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
-  -d '{"user_id":"u1","message":"Chuyển 2tr cho Minh tiền ăn","session_id":"s1"}'
-# Copy action_id
+  -d '{"user_id":"u1","message":"Chuyển 2tr cho Minh","session_id":"s1"}'
+# Get action_id
 
 curl -X POST http://localhost:8000/actions/{action_id}/confirm \
   -H "Content-Type: application/json" -d '{"user_id":"u1"}'
-# → {"status":"executed","message":"...","execution_id":"txn_xxx"}
+# → {"status":"executed","execution_id":"txn_..."}
 
-# OTP flow
+# OTP flow (YELLOW — higher amount)
 curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
   -d '{"user_id":"u1","message":"Chuyển 15 triệu cho Lan","session_id":"s1"}'
 
 curl -X POST http://localhost:8000/actions/{action_id}/otp \
   -H "Content-Type: application/json" -d '{"user_id":"u1","otp_code":"123456"}'
-# → {"status":"executed",...}
+# → {"status":"executed"}
+
+# Error: wrong user
+curl -X POST http://localhost:8000/actions/{action_id}/confirm \
+  -H "Content-Type: application/json" -d '{"user_id":"u2"}'
+# → 401
 ```
-
-- 404: action not found
-- 401: user_id mismatch
-- 403: wrong auth type or blocked
-- 409: already executed
-
-**Test:** `pytest tests/test_api.py` — cover all error cases.
 
 ---
 
-## Phase 6: Audit + Integration Tests
+## Phase 9: Full Audit + E2E Tests
 
-> Goal: Thêm audit logging (lúc này mới cần AuditEntry model). Chạy full 5 demo scenarios.
+> Goal: Full AuditEntry model + viewer endpoint. All 5 demo scenarios pass end-to-end.
+>
+> **Note:** If time is short, audit can be simplified to just: `delegation_trace`, `plan`, `guardian_decision`, `final_status`.
+> The full AuditEntry below is the ideal; the minimal version still demonstrates observability.
 
-### Step 6.1: Thêm model `AuditEntry`
+### Step 9.1: `AuditEntry` model
 
-**File:** `backend/models.py` — thêm:
 ```python
 class AuditEntry(BaseModel):
     request_id: str
     user_id: str
     timestamp: str
-    intent: Optional[dict] = None
-    domain_agent: Optional[str] = None
+    intent: dict | None = None
+    domain_agent: str | None = None
     delegation_trace: list[str] = Field(default_factory=list)
-    draft: Optional[dict] = None
-    guardian_decision: Optional[dict] = None
-    friction_result: Optional[dict] = None
+    plan: dict | None = None
+    plan_execution: dict | None = None
+    draft: dict | None = None
+    guardian_decision: dict | None = None
+    friction_result: dict | None = None
+    execution_result: dict | None = None
     final_status: str
 ```
 
-### Step 6.2: `backend/services/audit.py`
+### Step 9.2: `backend/services/audit.py` — full implementation
 
-AuditLogger: log() + get_trace().
+AuditLogger: log() + get_trace(session_id) + get_recent(user_id).
 
-### Step 6.3: Wire audit vào agent_runtime
+### Step 9.3: `GET /audit/{session_id}` endpoint
 
-Sau mỗi process() → log AuditEntry.
-
-### Step 6.4: E2E tests — 5 demo scenarios
+### Step 9.4: E2E tests — all 5 scenarios
 
 ```bash
-# Scenario 1: GREEN — chat → confirm → executed
-# Scenario 2: YELLOW — chat → otp → executed
-# Scenario 3: RED — chat → blocked
-# Scenario 4: missing info → clarification_needed
-# Scenario 5: QA → classified, not implemented
-```
-
-**Test:** `pytest tests/test_e2e.py -v` — all 5 pass.
-
----
-
-## Phase 7: CardAgent (SHOULD HAVE)
-
-> Goal: LOCK_CARD and UNLOCK_CARD work end-to-end.
-
-### Step 7.1: Create `backend/data/cards.json`
-
-```json
-{
-  "u1": [
-    {"card_id": "card_001", "type": "credit", "brand": "Visa", "last4": "5678", "status": "active"},
-    {"card_id": "card_002", "type": "debit", "brand": "Visa", "last4": "1234", "status": "locked"}
-  ]
-}
-```
-
-### Step 7.2: Write `backend/agents/sub_agents/card_resolver.py`
-
-- Resolve card by type/brand/last4 hint
-- Return single card or multiple candidates for clarification
-
-### Step 7.3: Write `backend/agents/card.py`
-
-- Parse: operation (LOCK/UNLOCK) + card_hint
-- Delegate to CardResolverAgent
-- Build card_action_draft
-- Return DomainAgentOutput
-
-### Step 7.4: Write `backend/executors/card.py`
-
-- Mock: update card status in memory
-
-### Step 7.5: Wire CardAgent into orchestrator
-
-- task_type == CARD_OPERATION → CardAgent.run()
-- agent_runtime handles Guardian + Friction (LOCK=GREEN confirm, UNLOCK=YELLOW OTP)
-
-**Test:**
-```bash
-# Lock card
-curl -X POST http://localhost:8000/chat \
-  -d '{"user_id":"u1","message":"Khóa thẻ tín dụng","session_id":"s1"}'
-# → pending_auth, GREEN
-
-# Unlock card
-curl -X POST http://localhost:8000/chat \
-  -d '{"user_id":"u1","message":"Mở lại thẻ Visa đuôi 1234","session_id":"s1"}'
-# → pending_auth, YELLOW, otp
+pytest tests/test_e2e.py -v
+# Scenario 1: GREEN flow → confirm → executed ✓
+# Scenario 2: reference context → Text2SQL evidence → resolve → confirm ✓
+# Scenario 3: top recipient → Text2SQL → resolve → OTP → executed ✓
+# Scenario 4: ambiguous recipient → clarification ✓
+# Scenario 5: scam account → blocked ✓
 ```
 
 ---
 
-## Phase 8: DataQueryAgent + Text2SQL (SHOULD HAVE)
+## Phase 10: Frontend
 
-> Goal: User can ask spending questions, get NL answers backed by SQL.
+> Goal: Streamlit UI with chat + confirm/OTP/block modals + audit trace viewer.
 
-### Step 8.1: Create `backend/data/transactions.db` (SQLite)
-
-- Seed with 50-100 sample transactions for user u1
-- Columns: id, user_id, recipient_name, recipient_account, recipient_bank, amount, category, date, transaction_type, note
-
-### Step 8.2: Write `backend/agents/sub_agents/text2sql.py`
-
-- LLM generates SQL template + params from natural language query
-- Returns sql_template + params (never executes)
-
-### Step 8.3: Write `backend/services/sql_guardian.py`
-
-- Validate: SELECT only, table allowlist, user_id scoped, LIMIT present
-- Reject DML/DDL
-
-### Step 8.4: Write `backend/executors/sql.py`
-
-- Execute validated SQL against SQLite
-- Inject user_id from auth context (ignore LLM-generated user_id)
-- Return result rows
-
-### Step 8.5: Write `backend/agents/data_query.py`
-
-- Plan query → delegate to Text2SQLAgent → SQLGuardian → SQLExecutor
-- Summarize result in natural language (LLM call)
-- Return DomainAgentOutput(status="info_response", info_response="...")
-
-### Step 8.6: Wire into orchestrator
-
-- task_type == DATA_QUERY → DataQueryAgent.run()
-
-**Test:**
-```bash
-curl -X POST http://localhost:8000/chat \
-  -d '{"user_id":"u1","message":"Tháng này tôi tiêu bao nhiêu cho ăn uống?","session_id":"s1"}'
-# → completed, "Tháng này bạn đã chi X đồng cho ăn uống (Y giao dịch)."
-```
-
----
-
-## Phase 9: Frontend (SHOULD HAVE)
-
-> Goal: Streamlit UI with chat + confirm/OTP/block modals + audit viewer.
-
-### Step 9.1: `frontend/app.py` — main layout
-### Step 9.2: `frontend/components/chat.py` — chat interface
-### Step 9.3: `frontend/components/bank_confirm.py` — confirm modal (GREEN)
-### Step 9.4: `frontend/components/otp_modal.py` — OTP input (YELLOW)
-### Step 9.5: `frontend/components/audit_viewer.py` — expandable trace
+### Step 10.1: `frontend/app.py` — main layout
+### Step 10.2: `frontend/components/chat.py` — chat interface
+### Step 10.3: `frontend/components/bank_confirm.py` — confirm modal (GREEN)
+### Step 10.4: `frontend/components/otp_modal.py` — OTP input (YELLOW)
+### Step 10.5: `frontend/components/blocked_warning.py` — block explanation (RED)
+### Step 10.6: `frontend/components/audit_viewer.py` — expandable trace: plan → execution → guardian → friction
 
 **Test:** `streamlit run frontend/app.py` → all demo scenarios work visually.
+
+---
+
+## Later: CardAgent + DataQueryAgent
+
+> Reuse the same planning/runtime pattern established in Phase 6.
+
+### CardAgent
+```python
+CARD_ALLOWED_AGENTS = {"card_resolver"}
+
+class CardAgent:
+    # Uses same: extract → plan → validate → execute → build_draft → Guardian → Friction
+    # card_resolver queries banking.db (future: cards table) or mock JSON
+```
+
+### DataQueryAgent
+```python
+DATA_QUERY_ALLOWED_AGENTS = {"text2sql"}
+
+class DataQueryAgent:
+    # Uses same: extract → plan → validate → execute → summarize
+    # Returns DomainAgentOutput(status="info_response") — no ActionDraft
+    # Guardian not required for read-only queries
+```
 
 ---
 
@@ -551,23 +1342,39 @@ curl -X POST http://localhost:8000/chat \
 
 | Phase | Deliverable | Can demo |
 |-------|-------------|----------|
-| 1 | ChatRequest + echo endpoint | Server starts, nhận đúng request |
-| 2 | IntentResult + ChatResponse + LLM classify | "Chuyển 2tr" → TRANSACTION |
-| 3 | DomainAgentOutput + TransactionAgent + BeneficiaryAgent | Draft built từ NL |
-| 4 | GuardianDecision + FrictionResult + PendingAction + AgentRuntime | Risk tiers, block/allow |
-| 5 | ActionResponse + Confirm/OTP endpoints + Executor | Full lifecycle |
-| 6 | AuditEntry + full trace | 5 scenarios pass |
-| 7 | CardAgent | Lock/unlock card |
-| 8 | DataQueryAgent + Text2SQL | NL → SQL → NL answer |
-| 9 | Frontend | Visual demo |
+| 1 | ChatRequest + ChatResponse envelope + echo | Server starts, stable API |
+| 2 | IntentResult + LLM classify | "Chuyển 2tr" → TRANSACTION |
+| 3 | banking.db + TransactionAgent + RecipientResolution (hardcoded) | Draft from NL, realistic DB |
+| 4 | RecipientResolution + resolve_with_evidence | Evidence-based verification |
+| 5 | Text2SQLAgent + SQLGuardian + SQLExecutor | Complex evidence queries |
+| 6 | Dynamic planning (AgentPlan + Registry + Validator + Executor) | **Agent-to-agent tự động** |
+| 7 | Guardian + Friction + PendingAction + minimal audit | Risk tiers, block/allow |
+| 8 | Confirm/OTP + Executor | Full lifecycle |
+| 9 | Full AuditEntry + E2E tests | 5 scenarios pass |
+| 10 | Frontend | Visual demo |
+
+---
+
+## Architecture Invariants
+
+1. **Orchestrator is a thin router.** Only maps intent → domain agent. No business logic.
+2. **Dynamic planning is resolution-only.** LLM planner CANNOT generate execution/approval steps.
+3. **Each domain agent has an allowlist.** TransactionAgent can only call: recipient_resolution, text2sql.
+4. **Text2SQL is evidence-retrieval only.** SELECT only. Validated by SQLGuardian. user_id injected by backend.
+5. **RecipientResolutionAgent auto-resolves only with exactly 1 high-confidence verified candidate.** Multiple candidates or low confidence → clarification_needed.
+6. **Guardian is mandatory for all ActionDrafts.** No bypass, even for GREEN tier.
+7. **Typed models at boundaries.** TransactionExtraction, ActionDraft, GuardianDecision — never raw dict.
+8. **Fixed outer control plane.** Guardian → Friction → PendingAction → Executor is never LLM-controlled.
+9. **Never trust LLM-generated user_id.** SQLExecutor always injects from backend auth context.
+10. **Text2SQL must not:** execute money movement, approve transactions, choose recipients, bypass Guardian, generate DML/DDL.
 
 ---
 
 ## Rules
 
 1. **Mỗi step chỉ code đúng những gì cần để test step đó** — không tạo trước
-2. Model mới chỉ xuất hiện ở phase nào cần nó lần đầu
+2. Model mới chỉ xuất hiện ở phase nào cần nó lần đầu (exception: ChatResponse Phase 1 as API contract)
 3. Endpoint mới chỉ tạo khi có logic xử lý, không tạo stub endpoint
 4. File/folder mới chỉ tạo khi step đó import từ nó
 5. Run server sau mỗi step để verify no import error
-6. Guardian luôn được gọi cho mọi action — kể cả GREEN
+6. banking.db created once at Phase 3, reused by all subsequent phases
