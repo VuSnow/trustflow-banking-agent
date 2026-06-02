@@ -167,6 +167,7 @@ Orchestrator phân loại **một** `task_type` cấp cao và route đến Domai
 | CARD_OPERATION | CardAgent | LOCK_CARD, UNLOCK_CARD, ACTIVATE_CARD, REISSUE_CARD, CHANGE_CARD_LIMIT, VIEW_CARD_INFO |
 | ACCOUNT_OPERATION | AccountAgent | OPEN_ACCOUNT, CLOSE_ACCOUNT, UPDATE_ACCOUNT_INFO, MANAGE_BENEFICIARY, VIEW_ACCOUNT_INFO |
 | LOAN_OPERATION | LoanAgent | APPLY_LOAN, CHECK_LOAN_STATUS, REPAY_LOAN, VIEW_LOAN_INFO |
+| FRAUD_REPORT | FraudReportAgent | REPORT_FRAUD_ACCOUNT |
 
 Orchestrator **KHÔNG**:
 - Extract entity từ tin nhắn
@@ -321,6 +322,14 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │  │   → Ủy quyền cho PolicyRetrieverAgent                         │  │
 │  │   → Sinh câu trả lời có trích dẫn                             │  │
 │  │                                                               │  │
+│  │ • FraudReportAgent:                                           │  │
+│  │   → Parse thông tin báo cáo gian lận (LLM extract)            │  │
+│  │   → Ủy quyền cho FraudVerificationAgent (kiểm tra giao dịch)  │  │
+│  │   → Multi-turn: hỏi context gian lận                          │  │
+│  │   → Tính confidence score (rule-based)                        │  │
+│  │   → Xây fraud_report_draft                                    │  │
+│  │   → Trả draft cho agent runtime                               │  │
+│  │                                                               │  │
 │  │ • AccountAgent / LoanAgent (cùng pattern)                     │  │
 │  └───────────────────────────┬───────────────────────────────────┘  │
 │                              │                                      │
@@ -334,6 +343,7 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │  │ • AccountProfileAgent       → resolve thông tin tài khoản     │  │
 │  │ • LoanInfoAgent             → tra cứu chi tiết khoản vay      │  │
 │  │ • PolicyRetrieverAgent      → truy xuất policy docs + version │  │
+│  │ • FraudVerificationAgent    → xác minh user có GD với STK     │  │
 │  │ • Text2SQLAgent             → chỉ sinh SQL                    │  │
 │  │                                                               │  │
 │  │ ⚠️  Sub-agent chỉ chuẩn bị/truy xuất.                         │  │
@@ -359,6 +369,8 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │  │                                                               │  │
 │  │ Layer 1: HARD RULES (deterministic, quyết định ngay)          │  │
 │  │   • Recipient trong reported_accounts → RED                   │  │
+│  │   • Recipient risk_level = CRITICAL → RED                     │  │
+│  │   • Recipient risk_level = HIGH → ORANGE tối thiểu             │  │
 │  │   • Số tiền > daily_limit → BLOCK                             │  │
 │  │   • Từ khóa áp lực/đe dọa → ORANGE tối thiểu                  │  │
 │  │   • SQL chứa DML/DDL → REJECT                                 │  │
@@ -384,6 +396,7 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │  │ • SQLExecutor         → chạy read-only query đã validate      │  │
 │  │ • AccountExecutor     → thao tác tài khoản                    │  │
 │  │ • LoanExecutor        → thao tác khoản vay                    │  │
+│  │ • FraudReportExecutor → insert fraud_reports, cập nhật risk   │  │
 │  │                                                               │  │
 │  │ ⚠️  Executor CHỈ chạy sau khi Guardian approve + auth pass.   │  │
 │  │ ⚠️  Idempotency key chống double-execution.                   │  │
@@ -402,6 +415,8 @@ Agent gọi (Domain Agent hoặc sub-agent)
 │  │ • users.json (profile + behavioral baselines)                 │  │
 │  │ • beneficiaries.json (người nhận đã lưu theo user)            │  │
 │  │ • reported_accounts.json (registry scam)                      │  │
+│  │ • fraud_reports (báo cáo gian lận có bằng chứng)              │  │
+│  │ • reported_customers (tín hiệu risk cấp khách hàng)           │  │
 │  │ • transactions.db (SQLite, pre-seeded)                        │  │
 │  │ • policies/*.md (tài liệu policy có version)                  │  │
 │  └───────────────────────────────────────────────────────────────┘  │
@@ -664,6 +679,164 @@ Response:
 | REISSUE_CARD | YELLOW (OTP) | Xác minh địa chỉ nếu cần |
 | CHANGE_CARD_LIMIT | ORANGE (challenge + OTP) | Ảnh hưởng lớn đến chi tiêu |
 | VIEW_CARD_INFO | GREEN (đã auth session, output bị mask) | Chỉ đọc |
+
+---
+
+## 10b. Flow FraudReportAgent
+
+### Ví dụ: "Tôi muốn báo cáo số tài khoản 123456789 tại ngân hàng VCB lừa đảo tôi"
+
+```text
+1. Orchestrator phân loại:
+   task_type = FRAUD_REPORT
+   route → FraudReportAgent
+
+2. FraudReportAgent parse (LLM extract):
+   operation = REPORT_FRAUD_ACCOUNT
+   reported_account_no = "123456789"
+   reported_bank_code = "VCB"
+   reason_hint = "lừa đảo"
+
+3. FraudReportAgent ủy quyền cho FraudVerificationAgent:
+   task: "verify_transaction_relationship"
+   constraints: {
+     user_id: "u1",
+     counterparty_account_no: "123456789",
+     counterparty_bank_code: "VCB"
+   }
+
+4. FraudVerificationAgent:
+   → Query transactions WHERE cif_no = :user_cif
+     AND counterparty_account_no = :reported_account
+     AND counterparty_bank_code = :reported_bank
+     AND direction = 'OUT'
+     AND status = 'SUCCESS'
+   → Nếu 0 kết quả: trả {status: "no_relationship"}
+   → Nếu có kết quả: trả {status: "verified", transactions: [...]}
+
+5. Nếu no_relationship:
+   FraudReportAgent trả:
+   "Không tìm thấy giao dịch nào giữa bạn và tài khoản 123456789 (VCB).
+    Chưa thể tạo báo cáo gian lận chính thức."
+   → Kết thúc flow.
+
+6. Nếu verified (có giao dịch):
+   FraudReportAgent hiển thị giao dịch khớp:
+   "Tôi tìm thấy 2 giao dịch đến tài khoản này:
+    1. 15,000,000đ ngày 20/05/2026 - 'Đặt cọc mua hàng'
+    2. 5,000,000đ ngày 22/05/2026 - 'Chuyển thêm phí ship'
+    Bạn muốn report giao dịch nào? (1, 2, hoặc cả hai)"
+
+7. User chọn → FraudReportAgent hỏi context gian lận (multi-turn):
+
+   Q1: "Bạn chuyển tiền vì lý do gì?"
+       Options: Mua hàng / Đặt cọc / Đầu tư / Vay tiền / Người quen giả danh / Khác
+   → User: "Mua hàng"
+
+   Q2: "Bạn bị liên hệ qua kênh nào?"
+       Options: Facebook / Zalo / Telegram / Website / Điện thoại / Khác
+   → User: "Facebook"
+
+   Q3: "Sau khi chuyển tiền, chuyện gì xảy ra?"
+       Options: Bị chặn liên lạc / Không nhận được hàng / Bị yêu cầu thêm tiền / Link biến mất / Khác
+   → User: "Bị chặn liên lạc"
+
+   Q4: "Bạn có bằng chứng không?"
+       Options: Có ảnh tin nhắn / Có số điện thoại-link / Không có
+   → User: "Có ảnh tin nhắn"
+
+8. FraudReportAgent tính confidence_score:
+   +40: có giao dịch đã xác minh
+   +20: giao dịch trong 30 ngày
+   +15: fraud_type rõ ràng (SHOPPING_SCAM)
+   +15: aftermath rõ ràng (BLOCKED_CONTACT)
+   +10: có bằng chứng
+   = 100 → CRITICAL confidence
+
+9. FraudReportAgent xây fraud_report_draft:
+   {
+     operation: "REPORT_FRAUD_ACCOUNT",
+     reported_account_no: "123456789",
+     reported_bank_code: "VCB",
+     transaction_ref: "TXN202605150001",
+     fraud_type: "SHOPPING_SCAM",
+     contact_channel: "FACEBOOK",
+     aftermath: "BLOCKED_CONTACT",
+     has_evidence: true,
+     confidence_score: 100,
+     reason_text: "Mua hàng qua Facebook, chuyển 15tr đặt cọc, bị chặn liên lạc"
+   }
+
+10. Guardian validate:
+    - FRAUD_REPORT là hành động bảo vệ
+    - confidence_score >= 40 (có bằng chứng giao dịch thật)
+    - score = 0.0 → GREEN
+
+11. FrictionRouter: bank_confirm (hành động bảo vệ, friction tối thiểu)
+
+12. User xác nhận → FraudReportExecutor:
+    a. INSERT fraud_reports (status = VALIDATED)
+    b. UPSERT reported_accounts:
+       - Tăng valid_report_count, unique_reporter_count
+       - Cộng vào total_reported_amount
+       - Tính lại risk_score và risk_level
+    c. NẾU cùng ngân hàng (reported_bank = bank của mình):
+       - Tra cứu customer bằng account → lấy cif_no
+       - UPSERT reported_customers
+    d. INSERT fraud_decisions log
+
+13. Response:
+    "Báo cáo gian lận đã được ghi nhận. Tài khoản 123456789 (VCB) đã được
+     đánh dấu để bảo vệ người dùng khác. Cảm ơn bạn đã báo cáo."
+
+14. Audit.log(toàn bộ fraud report trace)
+```
+
+### Transaction Screening (tích hợp với Guardian):
+
+Khi bất kỳ hành động TRANSFER nào được Guardian đánh giá:
+
+```text
+Guardian.evaluate(draft):
+  1. Kiểm tra reported_accounts:
+     SELECT risk_level, valid_report_count, status
+     FROM reported_accounts
+     WHERE account_no = draft.recipient_account
+       AND bank_code = draft.recipient_bank
+       AND status = 'ACTIVE'
+
+  2. Nếu tìm thấy:
+     - risk_level = LOW (1-2 report) → WARN (+0.3 vào risk_score)
+     - risk_level = MEDIUM (3-4 report) → STEP_UP_AUTH (+0.5)
+     - risk_level = HIGH (5+ report) → ORANGE tối thiểu (+0.7)
+     - risk_level = CRITICAL (đã xác nhận) → RED (chặn hoàn toàn)
+
+  3. Kiểm tra reported_customers (nếu cùng ngân hàng):
+     SELECT risk_level FROM reported_customers
+     WHERE cif_no = (SELECT cif_no FROM accounts WHERE account_no = draft.recipient_account)
+
+  4. Ghi fraud_decisions:
+     INSERT INTO fraud_decisions (decision, risk_level, reason_codes, ...)
+
+  5. Nếu quyết định WARN:
+     Message: "⚠️ Cảnh báo: Tài khoản này từng bị báo cáo lừa đảo bởi
+              người dùng khác. Bạn có chắc chắn muốn tiếp tục?"
+```
+
+### Quy tắc tính risk_level (hackathon):
+
+```text
+reported_accounts.risk_level:
+  1 báo cáo hợp lệ                    → LOW
+  2 báo cáo hợp lệ                    → MEDIUM
+  3-4 báo cáo từ 3+ user khác nhau    → HIGH
+  5+ báo cáo HOẶC đã xác nhận         → CRITICAL
+
+reported_customers.risk_level:
+  1 tài khoản bị report               → WATCH
+  2+ tài khoản bị report              → FROZEN (tự đóng băng)
+  Xác nhận gian lận trên bất kỳ TK    → BLOCKED
+```
 
 ---
 
@@ -1037,6 +1210,7 @@ trustflow-banking-agent/
 │   │   ├── card.py                    # CardExecutor
 │   │   ├── account.py                 # AccountExecutor
 │   │   ├── loan.py                    # LoanExecutor
+│   │   ├── fraud_report.py            # FraudReportExecutor
 │   │   └── sql.py                     # SQLExecutor (chỉ đọc)
 │   │
 │   ├── policies/                        # Workflow policies (agent được làm gì)
@@ -1171,7 +1345,8 @@ class ActionResponse(BaseModel):
 class IntentResult(BaseModel):
     task_type: Literal[
         "QA", "DATA_QUERY", "TRANSACTION",
-        "CARD_OPERATION", "ACCOUNT_OPERATION", "LOAN_OPERATION"
+        "CARD_OPERATION", "ACCOUNT_OPERATION", "LOAN_OPERATION",
+        "FRAUD_REPORT"
     ]
     operation: Optional[str] = None   # TRANSFER_MONEY, LOCK_CARD, v.v.
     risk_hint: Literal["LOW", "MEDIUM", "HIGH"] = "LOW"
@@ -1264,6 +1439,10 @@ class AuditEntry(BaseModel):
 | Người nhận lạ, số tiền trung bình | — | 0.3 ≤ score < 0.6 | YELLOW | OTP |
 | Phát hiện từ khóa áp lực | ORANGE tối thiểu | score 0.6–0.8 | ORANGE | challenge + OTP |
 | Tài khoản reported | RED ngay | bỏ qua | RED | blocked |
+| Tài khoản risk_level CRITICAL | RED ngay | bỏ qua | RED | blocked |
+| Tài khoản risk_level HIGH | ORANGE tối thiểu | +0.7 | ORANGE | challenge + OTP |
+| Tài khoản risk_level MEDIUM | — | +0.5 | tùy | tùy |
+| Tài khoản risk_level LOW | — | +0.3 | tùy | tùy |
 | Số tiền > 500M | RED ngay | bỏ qua | RED | blocked |
 | Số tiền ≥ 50M | — | +0.5 vào score | tùy | tùy |
 | Số tiền ≥ 10M | — | +0.25 vào score | tùy | tùy |
@@ -1277,6 +1456,8 @@ class AuditEntry(BaseModel):
 | REPAY_LOAN | — | ảnh hưởng tài chính | YELLOW | OTP |
 | SQL có DML/DDL | REJECT ngay | bỏ qua | — | — |
 | SQL không scope (thiếu user_id) | REJECT ngay | bỏ qua | — | — |
+| FRAUD_REPORT (đã xác minh GD) | — | hành động bảo vệ | GREEN | confirm |
+| FRAUD_REPORT (không có GD) | REJECT ngay | bỏ qua | — | — |
 
 ---
 

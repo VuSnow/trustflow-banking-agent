@@ -1,15 +1,16 @@
 """
-Load mock_data CSV files into SQLite database.
+Load CSV files into SQLite database.
 Usage: python load_csv_to_db.py
-Output: ./mock_data/banking.db
+Output: ../db/banking.db
 """
 import csv
 import sqlite3
 import os
 from pathlib import Path
 
-DATA_DIR = Path(os.path.dirname(__file__)) / "mock_data"
-DB_PATH = DATA_DIR / "banking.db"
+BASE_DIR = Path(os.path.dirname(__file__)).parent
+DATA_DIR = BASE_DIR / "csv"
+DB_PATH = BASE_DIR / "db" / "banking.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS customers (
@@ -162,6 +163,67 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at TEXT
 );
 
+-- Fraud tables
+CREATE TABLE IF NOT EXISTS fraud_reports (
+    report_id TEXT PRIMARY KEY,
+    reporter_cif_no TEXT NOT NULL REFERENCES customers(cif_no),
+    transaction_ref TEXT REFERENCES transactions(transaction_ref),
+    reported_account_no TEXT NOT NULL,
+    reported_bank_code TEXT NOT NULL,
+    reported_customer_cif TEXT,
+    fraud_type TEXT,
+    contact_channel TEXT,
+    aftermath TEXT,
+    reason_text TEXT,
+    has_evidence INTEGER DEFAULT 0,
+    confidence_score INTEGER CHECK(confidence_score BETWEEN 0 AND 100),
+    status TEXT CHECK(status IN ('SUBMITTED','VALIDATED','CONFIRMED','REJECTED')) DEFAULT 'SUBMITTED',
+    created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reported_accounts (
+    reported_account_id TEXT PRIMARY KEY,
+    account_no TEXT NOT NULL,
+    bank_code TEXT NOT NULL,
+    linked_customer_cif TEXT,
+    valid_report_count INTEGER DEFAULT 0,
+    unique_reporter_count INTEGER DEFAULT 0,
+    total_reported_amount INTEGER DEFAULT 0,
+    avg_confidence_score INTEGER DEFAULT 0,
+    risk_score REAL DEFAULT 0.0,
+    risk_level TEXT CHECK(risk_level IN ('LOW','MEDIUM','HIGH','CRITICAL')) DEFAULT 'LOW',
+    status TEXT CHECK(status IN ('ACTIVE','UNDER_REVIEW','CLEARED')) DEFAULT 'ACTIVE',
+    first_reported_at TEXT,
+    last_reported_at TEXT,
+    UNIQUE(account_no, bank_code)
+);
+
+CREATE TABLE IF NOT EXISTS reported_customers (
+    reported_customer_id TEXT PRIMARY KEY,
+    cif_no TEXT NOT NULL REFERENCES customers(cif_no),
+    reported_account_count INTEGER DEFAULT 0,
+    valid_report_count INTEGER DEFAULT 0,
+    total_reported_amount INTEGER DEFAULT 0,
+    risk_score REAL DEFAULT 0.0,
+    risk_level TEXT CHECK(risk_level IN ('WATCH','FROZEN','BLOCKED','CLEARED')) DEFAULT 'WATCH',
+    status TEXT DEFAULT 'ACTIVE',
+    created_at TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS fraud_decisions (
+    decision_id TEXT PRIMARY KEY,
+    action_id TEXT REFERENCES action_requests(action_id),
+    receiver_account_no TEXT NOT NULL,
+    receiver_bank_code TEXT NOT NULL,
+    matched_report_count INTEGER DEFAULT 0,
+    risk_score REAL DEFAULT 0.0,
+    risk_level TEXT,
+    decision TEXT CHECK(decision IN ('ALLOW','WARN','STEP_UP_AUTH','HOLD','BLOCK')),
+    reason_codes TEXT,
+    created_at TEXT
+);
+
 -- Indexes for common query patterns
 CREATE INDEX IF NOT EXISTS idx_accounts_cif ON accounts(cif_no);
 CREATE INDEX IF NOT EXISTS idx_cards_cif ON cards(cif_no);
@@ -173,6 +235,11 @@ CREATE INDEX IF NOT EXISTS idx_transactions_cif_time ON transactions(cif_no, tra
 CREATE INDEX IF NOT EXISTS idx_action_requests_cif ON action_requests(cif_no);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action_id);
 CREATE INDEX IF NOT EXISTS idx_cba_cif ON customer_biller_accounts(cif_no);
+CREATE INDEX IF NOT EXISTS idx_fraud_reports_reporter ON fraud_reports(reporter_cif_no);
+CREATE INDEX IF NOT EXISTS idx_fraud_reports_account ON fraud_reports(reported_account_no, reported_bank_code);
+CREATE INDEX IF NOT EXISTS idx_reported_accounts_lookup ON reported_accounts(account_no, bank_code);
+CREATE INDEX IF NOT EXISTS idx_reported_customers_cif ON reported_customers(cif_no);
+CREATE INDEX IF NOT EXISTS idx_fraud_decisions_action ON fraud_decisions(action_id);
 """
 
 # Tables in load order (respects FK dependencies)
@@ -189,14 +256,20 @@ TABLES = [
     "action_requests",
     "api_call_logs",
     "audit_logs",
+    "fraud_reports",
+    "reported_accounts",
+    "reported_customers",
+    "fraud_decisions",
 ]
 
 # Boolean fields that need conversion from True/False string to 0/1
-BOOL_FIELDS = {"is_saved", "requires_confirmation", "requires_otp"}
+BOOL_FIELDS = {"is_saved", "requires_confirmation", "requires_otp", "has_evidence"}
 
 # Integer fields (empty string → None)
 INT_FIELDS = {"balance", "available_balance", "credit_limit", "available_limit",
-              "amount", "balance_after", "http_status"}
+              "amount", "balance_after", "http_status", "confidence_score",
+              "valid_report_count", "unique_reporter_count", "total_reported_amount",
+              "avg_confidence_score", "reported_account_count", "matched_report_count"}
 
 
 def load_csv(conn, table_name):
@@ -249,6 +322,9 @@ def load_csv(conn, table_name):
 
 
 def main():
+    # Ensure db directory exists
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
     # Remove existing db
     if DB_PATH.exists():
         DB_PATH.unlink()

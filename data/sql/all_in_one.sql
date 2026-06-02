@@ -5,10 +5,14 @@
 
 -- ============================================================
 -- TrustFlow Banking Agent - Database Schema (PostgreSQL)
--- Generated from mock_data CSVs
+-- Generated from CSV data
 -- ============================================================
 
 -- Drop tables in reverse dependency order
+DROP TABLE IF EXISTS fraud_decisions CASCADE;
+DROP TABLE IF EXISTS reported_customers CASCADE;
+DROP TABLE IF EXISTS reported_accounts CASCADE;
+DROP TABLE IF EXISTS fraud_reports CASCADE;
 DROP TABLE IF EXISTS audit_logs CASCADE;
 DROP TABLE IF EXISTS api_call_logs CASCADE;
 DROP TABLE IF EXISTS action_requests CASCADE;
@@ -177,6 +181,70 @@ CREATE TABLE audit_logs (
 );
 
 -- ============================================================
+-- FRAUD TABLES
+-- ============================================================
+
+CREATE TABLE fraud_reports (
+    report_id UUID PRIMARY KEY,
+    reporter_cif_no VARCHAR(20) NOT NULL REFERENCES customers(cif_no),
+    transaction_ref VARCHAR(30) REFERENCES transactions(transaction_ref),
+    reported_account_no VARCHAR(20) NOT NULL,
+    reported_bank_code VARCHAR(10) NOT NULL,
+    reported_customer_cif VARCHAR(20),
+    fraud_type VARCHAR(30),
+    contact_channel VARCHAR(20),
+    aftermath VARCHAR(30),
+    reason_text TEXT,
+    has_evidence BOOLEAN DEFAULT FALSE,
+    confidence_score INTEGER CHECK(confidence_score BETWEEN 0 AND 100),
+    status VARCHAR(15) CHECK(status IN ('SUBMITTED','VALIDATED','CONFIRMED','REJECTED')) DEFAULT 'SUBMITTED',
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE reported_accounts (
+    reported_account_id UUID PRIMARY KEY,
+    account_no VARCHAR(20) NOT NULL,
+    bank_code VARCHAR(10) NOT NULL,
+    linked_customer_cif VARCHAR(20),
+    valid_report_count INTEGER DEFAULT 0,
+    unique_reporter_count INTEGER DEFAULT 0,
+    total_reported_amount BIGINT DEFAULT 0,
+    avg_confidence_score INTEGER DEFAULT 0,
+    risk_score NUMERIC(3,2) DEFAULT 0.0,
+    risk_level VARCHAR(10) CHECK(risk_level IN ('LOW','MEDIUM','HIGH','CRITICAL')) DEFAULT 'LOW',
+    status VARCHAR(15) CHECK(status IN ('ACTIVE','UNDER_REVIEW','CLEARED')) DEFAULT 'ACTIVE',
+    first_reported_at TIMESTAMP,
+    last_reported_at TIMESTAMP,
+    UNIQUE(account_no, bank_code)
+);
+
+CREATE TABLE reported_customers (
+    reported_customer_id UUID PRIMARY KEY,
+    cif_no VARCHAR(20) NOT NULL REFERENCES customers(cif_no),
+    reported_account_count INTEGER DEFAULT 0,
+    valid_report_count INTEGER DEFAULT 0,
+    total_reported_amount BIGINT DEFAULT 0,
+    risk_score NUMERIC(3,2) DEFAULT 0.0,
+    risk_level VARCHAR(10) CHECK(risk_level IN ('WATCH','FROZEN','BLOCKED','CLEARED')) DEFAULT 'WATCH',
+    status VARCHAR(15) DEFAULT 'ACTIVE',
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE fraud_decisions (
+    decision_id UUID PRIMARY KEY,
+    action_id UUID REFERENCES action_requests(action_id),
+    receiver_account_no VARCHAR(20) NOT NULL,
+    receiver_bank_code VARCHAR(10) NOT NULL,
+    matched_report_count INTEGER DEFAULT 0,
+    risk_score NUMERIC(3,2) DEFAULT 0.0,
+    risk_level VARCHAR(10),
+    decision VARCHAR(15) CHECK(decision IN ('ALLOW','WARN','STEP_UP_AUTH','HOLD','BLOCK')),
+    reason_codes JSONB,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ============================================================
 -- INDEXES
 -- ============================================================
 
@@ -191,6 +259,11 @@ CREATE INDEX idx_transactions_cif_type ON transactions(cif_no, transaction_type)
 CREATE INDEX idx_action_requests_cif ON action_requests(cif_no);
 CREATE INDEX idx_audit_logs_action ON audit_logs(action_id);
 CREATE INDEX idx_cba_cif ON customer_biller_accounts(cif_no);
+CREATE INDEX idx_fraud_reports_reporter ON fraud_reports(reporter_cif_no);
+CREATE INDEX idx_fraud_reports_account ON fraud_reports(reported_account_no, reported_bank_code);
+CREATE INDEX idx_reported_accounts_lookup ON reported_accounts(account_no, bank_code);
+CREATE INDEX idx_reported_customers_cif ON reported_customers(cif_no);
+CREATE INDEX idx_fraud_decisions_action ON fraud_decisions(action_id);
 
 
 BEGIN;
@@ -7351,5 +7424,54 @@ INSERT INTO audit_logs (audit_id, action_id, cif_no, event_type, actor, event_pa
   ('8143f26e-c8bc-5f73-b5b3-8475407671f1', 'fc5f609b-999b-501a-ad1c-b1c5d2bdbd56', 'CIF000042', 'ENTITY_EXTRACTED', 'TRANSACTION_AGENT', '{"event": "ENTITY_EXTRACTED", "action_type": "CARD_LIMIT_CHANGE"}'::jsonb, '2026-04-09 02:08:01'),
   ('80473f32-0552-5a71-80c5-e86241744cea', 'fc5f609b-999b-501a-ad1c-b1c5d2bdbd56', 'CIF000042', 'CARD_RESOLVED', 'TRANSACTION_AGENT', '{"event": "CARD_RESOLVED", "action_type": "CARD_LIMIT_CHANGE"}'::jsonb, '2026-04-09 02:08:02'),
   ('3dda02c9-0808-50ac-8144-419db702e9d8', 'fc5f609b-999b-501a-ad1c-b1c5d2bdbd56', 'CIF000042', 'RISK_CHECKED', 'GUARDIAN', '{"event": "RISK_CHECKED", "action_type": "CARD_LIMIT_CHANGE", "risk_score": 0.27, "risk_tier": "GREEN"}'::jsonb, '2026-04-09 02:08:04');
+
+-- fraud_reports (8 rows)
+INSERT INTO fraud_reports (report_id, reporter_cif_no, transaction_ref, reported_account_no, reported_bank_code, reported_customer_cif, fraud_type, contact_channel, aftermath, reason_text, has_evidence, confidence_score, status, created_at) VALUES
+  ('1c2372a8-ef70-5c8c-b6a0-d321c8b22f2e', 'CIF000032', 'TXN202603001513', '43275604177', 'ACB', NULL, 'ROMANCE_SCAM', 'WEBSITE', 'LINK_GONE', 'Bi lua dao qua website, link gone', TRUE, 80, 'VALIDATED', '2026-05-22 00:02:36'),
+  ('c11aaec2-2f0b-5159-a3ff-771d40f57fb4', 'CIF000051', 'TXN202602000633', '5347355289', 'ACB', NULL, 'LOAN_SCAM', 'WEBSITE', 'ASKED_MORE_MONEY', 'Bi lua dao qua website, asked more money', FALSE, 70, 'CONFIRMED', '2026-05-01 16:39:44'),
+  ('e8f9f896-7531-504e-9a28-56ca252b4dad', 'CIF000088', 'TXN202603001023', '0094318143', 'VIB', NULL, 'OTHER', 'ZALO', 'OTHER', 'Bi lua dao qua zalo, other', TRUE, 50, 'SUBMITTED', '2026-05-01 11:21:33'),
+  ('6b371e58-f6e9-55cf-895e-3590fe878dd2', 'CIF000004', 'TXN202605003200', '8812520566', 'VPB', NULL, 'LOAN_SCAM', 'ZALO', 'ASKED_MORE_MONEY', 'Bi lua dao qua zalo, asked more money', TRUE, 100, 'CONFIRMED', '2026-05-13 21:00:24'),
+  ('318d9aba-ab40-5daf-9d46-dcab67637630', 'CIF000046', 'TXN202604002425', '1832582386870', 'VCB', NULL, 'INVESTMENT_SCAM', 'ZALO', 'BLOCKED_CONTACT', 'Bi lua dao qua zalo, blocked contact', TRUE, 80, 'CONFIRMED', '2026-05-28 05:13:37'),
+  ('2ef631da-42ab-503c-a616-f5e909c01b88', 'CIF000077', 'TXN202512000185', '5215681820967', 'VIB', NULL, 'LOAN_SCAM', 'ZALO', 'NO_GOODS', 'Bi lua dao qua zalo, no goods', TRUE, 80, 'CONFIRMED', '2026-05-15 06:54:58'),
+  ('cfd17d65-7e5e-567b-8b43-5670eed249e0', 'CIF000089', 'TXN202601000328', '024120957907', 'CTG', NULL, 'IMPERSONATION', 'PHONE', 'NO_GOODS', 'Bi lua dao qua phone, no goods', FALSE, 70, 'CONFIRMED', '2026-06-01 01:07:25'),
+  ('4f9c6d99-7ce2-5341-bc50-5177ec0c0a02', 'CIF000056', 'TXN202602000569', '4125777118', 'CTG', NULL, 'LOAN_SCAM', 'OTHER', 'OTHER', 'Bi lua dao qua other, other', TRUE, 65, 'CONFIRMED', '2026-05-26 20:10:48');
+
+-- reported_accounts (8 rows)
+INSERT INTO reported_accounts (reported_account_id, account_no, bank_code, linked_customer_cif, valid_report_count, unique_reporter_count, total_reported_amount, avg_confidence_score, risk_score, risk_level, status, first_reported_at, last_reported_at) VALUES
+  ('f420f3a9-42b3-5536-9d7b-a7e0a3aec844', '43275604177', 'ACB', NULL, 1, 1, 22238685, 80, 0.95, 'CRITICAL', 'ACTIVE', '2026-05-22 00:02:36', '2026-05-22 00:02:36'),
+  ('562536e4-5ea2-5aaa-b816-a0699f710fb6', '5347355289', 'ACB', NULL, 1, 1, 3198935, 70, 0.25, 'LOW', 'ACTIVE', '2026-05-01 16:39:44', '2026-05-01 16:39:44'),
+  ('b9474b94-10b8-549e-bb72-ce33ad23a3a7', '0094318143', 'VIB', NULL, 1, 1, 32520461, 50, 0.25, 'LOW', 'ACTIVE', '2026-05-01 11:21:33', '2026-05-01 11:21:33'),
+  ('65622601-07ee-5f09-9e22-f4d37c7c61ab', '8812520566', 'VPB', NULL, 1, 1, 6046022, 100, 0.95, 'CRITICAL', 'ACTIVE', '2026-05-13 21:00:24', '2026-05-13 21:00:24'),
+  ('45adfeb9-d3ce-5d47-a48a-8d5bda314223', '1832582386870', 'VCB', NULL, 1, 1, 20646691, 80, 0.95, 'CRITICAL', 'ACTIVE', '2026-05-28 05:13:37', '2026-05-28 05:13:37'),
+  ('e9508d2d-13a5-5288-a6cf-7024eca3cc30', '5215681820967', 'VIB', NULL, 1, 1, 42524371, 80, 0.95, 'CRITICAL', 'ACTIVE', '2026-05-15 06:54:58', '2026-05-15 06:54:58'),
+  ('6df2e1d5-5d96-57cf-89f9-51324a31eeb2', '024120957907', 'CTG', NULL, 1, 1, 26083708, 70, 0.25, 'LOW', 'ACTIVE', '2026-06-01 01:07:25', '2026-06-01 01:07:25'),
+  ('c09a1cfe-7c54-5404-906c-b336f8ba5b67', '4125777118', 'CTG', NULL, 1, 1, 15955609, 65, 0.25, 'LOW', 'ACTIVE', '2026-05-26 20:10:48', '2026-05-26 20:10:48');
+
+-- reported_customers (3 rows)
+INSERT INTO reported_customers (reported_customer_id, cif_no, reported_account_count, valid_report_count, total_reported_amount, risk_score, risk_level, status, created_at, updated_at) VALUES
+  ('131ec971-efed-5a6b-9f41-6e41b2e264d5', 'CIF000067', 1, 2, 49701987, 0.4, 'WATCH', 'ACTIVE', '2026-05-30 07:29:57', '2026-05-23 11:45:41'),
+  ('26d68bc2-633d-51a3-898e-2528febcc262', 'CIF000080', 2, 4, 74015348, 0.7, 'FROZEN', 'ACTIVE', '2026-05-20 01:58:57', '2026-05-26 23:24:21'),
+  ('8ce963ae-702f-5ba1-bba3-63599123eff0', 'CIF000071', 2, 2, 33205321, 0.7, 'FROZEN', 'ACTIVE', '2026-05-14 18:07:01', '2026-05-21 20:03:00');
+
+-- fraud_decisions (18 rows)
+INSERT INTO fraud_decisions (decision_id, action_id, receiver_account_no, receiver_bank_code, matched_report_count, risk_score, risk_level, decision, reason_codes, created_at) VALUES
+  ('ac365eea-48c4-514a-8d7b-15f2da68abae', '95ff56b0-cd92-5fc7-9f5a-c0c32ebbf29f', '2762126796', 'VIB', 0, 0.0, 'NONE', 'ALLOW', '["HIGH_RISK_ACTION"]'::jsonb, '2026-04-04 07:55:53'),
+  ('04b38cb9-6fec-5a4f-9308-3fb2da436cda', '44888f96-0759-502c-a6c8-1401b62fa66e', '852986755422', 'TPB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-06 13:54:36'),
+  ('c66f6210-3bd6-55b4-85e6-e33059ab938e', '953fc2d5-a8a0-577b-992b-26cce83e7403', '1307240787', 'MB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-18 00:12:11'),
+  ('d68c2e8d-c84b-5726-b972-134551bcbcf4', '8de009cd-525d-524a-a964-6058a751b0b0', '134228499390', 'TPB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-05 11:14:03'),
+  ('91693558-3d67-54ea-86f7-52b66c6b8c7c', 'd97f11b6-08c6-5f73-8e6b-a740f087f632', '4659116655', 'CTG', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-07 15:37:22'),
+  ('f50c9374-3465-54d2-9d84-13d651f1af60', 'f55f4852-fff7-55a8-852f-31017a328561', '654420949407', 'VIB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-15 17:38:03'),
+  ('003aec78-fed7-5857-b393-a3ef0ae690e9', '343a6bf9-5127-5110-b89a-83bd6b698bd3', '75480157164', 'STB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-26 19:23:34'),
+  ('3a5bbddd-7677-509f-acde-e744ab1fbc3e', '63868f48-dab5-5041-9287-b41be7f3664d', '12447315847', 'STB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-04 22:20:19'),
+  ('89b0e2ba-106f-5cb4-ac5a-12f0e89de442', '774ac552-112c-5961-9004-5b534c309a2f', '7884795137', 'TCB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-13 17:09:46'),
+  ('31b065b2-e246-51ef-9fde-57c5eeb4cbcb', 'b89dcb33-433b-549c-8641-44aef991352a', '285067625153', 'TPB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-18 16:48:08'),
+  ('831edfe2-bac4-54c3-9ed6-332ad20d40a2', '63e3c3d7-64e8-5cc3-acfd-10ff0a748e67', '688191112919', 'STB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-27 02:40:23'),
+  ('cc620d68-80b8-56f6-9cb3-b9ae0191df6f', '10a66751-e588-52b3-8c89-c500d10fd465', '872975859883', 'TCB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-22 08:25:12'),
+  ('ff3ca2ff-301d-5454-902f-df09ef96732a', '0a533c01-05e0-50ea-8f6e-e4bed9530554', '5668633414', 'TCB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-06 21:25:36'),
+  ('899106db-15df-536a-9be9-1c7660beef96', '3a215828-8d64-5fff-ab8e-d583cb268805', '3213580040104', 'TCB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-14 13:33:28'),
+  ('8fc5a322-1975-579c-b957-a9aa2300a6b0', '2f99ac8a-c926-5007-b851-c1d4a83844db', '390789567766', 'MB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-14 20:29:59'),
+  ('44cc85b4-f08b-5376-8886-66d4ac8c6d80', 'fa02d6fb-b5f1-58ae-82b0-54b132212042', '14519515109', 'BIDV', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-09 00:52:40'),
+  ('e376b7af-8ec9-5758-8d32-8fc4ab0af2d0', 'd0ed39b1-093d-59b1-b922-51dd660f9625', '419876351484', 'ACB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-05-04 08:23:22'),
+  ('0f9b857b-7353-5499-aa3e-a88fbefaa29b', '11a9e652-86e8-508c-b853-7a006d2a77fb', '6940496365', 'VCB', 0, 0.0, 'NONE', 'ALLOW', '[]'::jsonb, '2026-04-08 09:43:53');
 
 COMMIT;

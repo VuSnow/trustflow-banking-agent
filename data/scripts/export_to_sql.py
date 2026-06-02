@@ -1,26 +1,31 @@
 """
-Export mock_data CSV files to SQL files.
+Export CSV files to SQL files.
 Usage: python export_to_sql.py
 
 Output:
-  ./mock_data/sql/01_schema.sql       - DDL (CREATE TABLE, INDEX)
-  ./mock_data/sql/02_data.sql         - INSERT statements for all tables
-  ./mock_data/sql/all_in_one.sql      - Combined schema + data
+  ../sql/01_schema.sql       - DDL (CREATE TABLE, INDEX)
+  ../sql/02_*.sql            - INSERT statements per table
+  ../sql/all_in_one.sql      - Combined schema + data
 """
 import csv
 import os
 from pathlib import Path
 
-DATA_DIR = Path(os.path.dirname(__file__)) / "mock_data"
-SQL_DIR = DATA_DIR / "sql"
+BASE_DIR = Path(os.path.dirname(__file__)).parent
+DATA_DIR = BASE_DIR / "csv"
+SQL_DIR = BASE_DIR / "sql"
 
 SCHEMA_SQL = """\
 -- ============================================================
 -- TrustFlow Banking Agent - Database Schema (PostgreSQL)
--- Generated from mock_data CSVs
+-- Generated from CSV data
 -- ============================================================
 
 -- Drop tables in reverse dependency order
+DROP TABLE IF EXISTS fraud_decisions CASCADE;
+DROP TABLE IF EXISTS reported_customers CASCADE;
+DROP TABLE IF EXISTS reported_accounts CASCADE;
+DROP TABLE IF EXISTS fraud_reports CASCADE;
 DROP TABLE IF EXISTS audit_logs CASCADE;
 DROP TABLE IF EXISTS api_call_logs CASCADE;
 DROP TABLE IF EXISTS action_requests CASCADE;
@@ -189,6 +194,70 @@ CREATE TABLE audit_logs (
 );
 
 -- ============================================================
+-- FRAUD TABLES
+-- ============================================================
+
+CREATE TABLE fraud_reports (
+    report_id UUID PRIMARY KEY,
+    reporter_cif_no VARCHAR(20) NOT NULL REFERENCES customers(cif_no),
+    transaction_ref VARCHAR(30) REFERENCES transactions(transaction_ref),
+    reported_account_no VARCHAR(20) NOT NULL,
+    reported_bank_code VARCHAR(10) NOT NULL,
+    reported_customer_cif VARCHAR(20),
+    fraud_type VARCHAR(30),
+    contact_channel VARCHAR(20),
+    aftermath VARCHAR(30),
+    reason_text TEXT,
+    has_evidence BOOLEAN DEFAULT FALSE,
+    confidence_score INTEGER CHECK(confidence_score BETWEEN 0 AND 100),
+    status VARCHAR(15) CHECK(status IN ('SUBMITTED','VALIDATED','CONFIRMED','REJECTED')) DEFAULT 'SUBMITTED',
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE reported_accounts (
+    reported_account_id UUID PRIMARY KEY,
+    account_no VARCHAR(20) NOT NULL,
+    bank_code VARCHAR(10) NOT NULL,
+    linked_customer_cif VARCHAR(20),
+    valid_report_count INTEGER DEFAULT 0,
+    unique_reporter_count INTEGER DEFAULT 0,
+    total_reported_amount BIGINT DEFAULT 0,
+    avg_confidence_score INTEGER DEFAULT 0,
+    risk_score NUMERIC(3,2) DEFAULT 0.0,
+    risk_level VARCHAR(10) CHECK(risk_level IN ('LOW','MEDIUM','HIGH','CRITICAL')) DEFAULT 'LOW',
+    status VARCHAR(15) CHECK(status IN ('ACTIVE','UNDER_REVIEW','CLEARED')) DEFAULT 'ACTIVE',
+    first_reported_at TIMESTAMP,
+    last_reported_at TIMESTAMP,
+    UNIQUE(account_no, bank_code)
+);
+
+CREATE TABLE reported_customers (
+    reported_customer_id UUID PRIMARY KEY,
+    cif_no VARCHAR(20) NOT NULL REFERENCES customers(cif_no),
+    reported_account_count INTEGER DEFAULT 0,
+    valid_report_count INTEGER DEFAULT 0,
+    total_reported_amount BIGINT DEFAULT 0,
+    risk_score NUMERIC(3,2) DEFAULT 0.0,
+    risk_level VARCHAR(10) CHECK(risk_level IN ('WATCH','FROZEN','BLOCKED','CLEARED')) DEFAULT 'WATCH',
+    status VARCHAR(15) DEFAULT 'ACTIVE',
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE fraud_decisions (
+    decision_id UUID PRIMARY KEY,
+    action_id UUID REFERENCES action_requests(action_id),
+    receiver_account_no VARCHAR(20) NOT NULL,
+    receiver_bank_code VARCHAR(10) NOT NULL,
+    matched_report_count INTEGER DEFAULT 0,
+    risk_score NUMERIC(3,2) DEFAULT 0.0,
+    risk_level VARCHAR(10),
+    decision VARCHAR(15) CHECK(decision IN ('ALLOW','WARN','STEP_UP_AUTH','HOLD','BLOCK')),
+    reason_codes JSONB,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ============================================================
 -- INDEXES
 -- ============================================================
 
@@ -203,6 +272,11 @@ CREATE INDEX idx_transactions_cif_type ON transactions(cif_no, transaction_type)
 CREATE INDEX idx_action_requests_cif ON action_requests(cif_no);
 CREATE INDEX idx_audit_logs_action ON audit_logs(action_id);
 CREATE INDEX idx_cba_cif ON customer_biller_accounts(cif_no);
+CREATE INDEX idx_fraud_reports_reporter ON fraud_reports(reporter_cif_no);
+CREATE INDEX idx_fraud_reports_account ON fraud_reports(reported_account_no, reported_bank_code);
+CREATE INDEX idx_reported_accounts_lookup ON reported_accounts(account_no, bank_code);
+CREATE INDEX idx_reported_customers_cif ON reported_customers(cif_no);
+CREATE INDEX idx_fraud_decisions_action ON fraud_decisions(action_id);
 """
 
 # Tables in load order
@@ -219,18 +293,25 @@ TABLES = [
     "action_requests",
     "api_call_logs",
     "audit_logs",
+    "fraud_reports",
+    "reported_accounts",
+    "reported_customers",
+    "fraud_decisions",
 ]
 
 # Boolean fields
-BOOL_FIELDS = {"is_saved", "requires_confirmation", "requires_otp"}
+BOOL_FIELDS = {"is_saved", "requires_confirmation", "requires_otp", "has_evidence"}
 
 # Integer fields
 INT_FIELDS = {"balance", "available_balance", "credit_limit", "available_limit",
-              "amount", "balance_after", "http_status"}
+              "amount", "balance_after", "http_status", "confidence_score",
+              "valid_report_count", "unique_reporter_count", "total_reported_amount",
+              "avg_confidence_score", "reported_account_count", "matched_report_count"}
 
 # JSONB fields - don't quote, wrap in single quotes as raw JSON
 JSON_FIELDS = {"api_payload", "resolved_entities", "missing_fields",
-               "request_payload", "response_payload", "event_payload"}
+               "request_payload", "response_payload", "event_payload",
+               "reason_codes"}
 
 
 def escape_sql_string(val):

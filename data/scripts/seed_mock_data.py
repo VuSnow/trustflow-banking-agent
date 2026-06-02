@@ -1,7 +1,7 @@
 """
 seed_mock_data.py - Generate mock data CSV for banking transaction agent demo.
 Run: python seed_mock_data.py
-Output: ./mock_data/ folder with 12 CSV files + README.md
+Output: ../csv/ folder with 16 CSV files + README.md
 """
 
 import csv
@@ -20,7 +20,7 @@ SEED = 42
 random.seed(SEED)
 
 FIXED_NOW = datetime(2026, 6, 1, 12, 0, 0)
-OUTPUT_DIR = Path("./mock_data")
+OUTPUT_DIR = Path(os.path.dirname(__file__)).parent / "csv"
 
 BANK_MAP = {
     "VCB": "Vietcombank",
@@ -143,6 +143,10 @@ transactions = []
 action_requests = []
 api_call_logs = []
 audit_logs = []
+fraud_reports = []
+reported_accounts_list = []
+reported_customers_list = []
+fraud_decisions_list = []
 
 # Lookup dicts
 cust_by_cif = {}
@@ -1663,6 +1667,232 @@ def generate_audit_logs():
 
 
 # ============================================================
+# FRAUD DATA GENERATION
+# ============================================================
+
+def generate_fraud_data():
+    """Generate fraud_reports, reported_accounts, reported_customers, fraud_decisions."""
+    global fraud_reports, reported_accounts_list, reported_customers_list, fraud_decisions_list
+
+    FRAUD_TYPES = ["SHOPPING_SCAM", "INVESTMENT_SCAM", "LOAN_SCAM", "IMPERSONATION", "ROMANCE_SCAM", "OTHER"]
+    CONTACT_CHANNELS = ["FACEBOOK", "ZALO", "TELEGRAM", "WEBSITE", "PHONE", "OTHER"]
+    AFTERMATHS = ["BLOCKED_CONTACT", "NO_GOODS", "ASKED_MORE_MONEY", "LINK_GONE", "OTHER"]
+
+    active_custs = [c for c in customers if c["status"] == "ACTIVE"]
+    active_cifs = [c["cif_no"] for c in active_custs]
+
+    # Pick some outgoing BANK_TRANSFER transactions to use as basis for fraud reports
+    out_transfers = [t for t in transactions
+                     if t["transaction_type"] == "BANK_TRANSFER"
+                     and t["direction"] == "OUT"
+                     and t["status"] == "SUCCESS"
+                     and t["counterparty_account_no"]
+                     and t["counterparty_bank_code"]]
+
+    # Group transfers by counterparty to simulate multiple reporters
+    from collections import defaultdict
+    cp_to_txns = defaultdict(list)
+    for t in out_transfers:
+        key = (t["counterparty_account_no"], t["counterparty_bank_code"])
+        cp_to_txns[key].append(t)
+
+    # Select 8 counterparty accounts to be "scam accounts"
+    # Pick ones with multiple reporters for realistic data
+    scam_candidates = [(k, v) for k, v in cp_to_txns.items() if len(v) >= 2]
+    if len(scam_candidates) < 8:
+        scam_candidates = list(cp_to_txns.items())[:8]
+    else:
+        scam_candidates = random.sample(scam_candidates, min(8, len(scam_candidates)))
+
+    report_idx = 1
+    ra_idx = 1
+    rc_idx = 1
+
+    # Track reported accounts for aggregation
+    ra_map = {}  # (account_no, bank_code) -> reported_account record
+    rc_map = {}  # cif_no -> reported_customer record
+
+    for (cp_acc, cp_bank), txn_list in scam_candidates:
+        # Create 1-5 fraud reports for this scam account from different users
+        num_reports = min(len(txn_list), random.randint(1, 5))
+        reporters_used = set()
+        total_amount = 0
+        confidence_scores = []
+
+        for i in range(num_reports):
+            txn = txn_list[i % len(txn_list)]
+            reporter_cif = txn["cif_no"]
+
+            # Skip if same reporter already reported this account
+            if reporter_cif in reporters_used:
+                continue
+            reporters_used.add(reporter_cif)
+
+            fraud_type = random.choice(FRAUD_TYPES)
+            contact_channel = random.choice(CONTACT_CHANNELS)
+            aftermath = random.choice(AFTERMATHS)
+            has_evidence = random.random() < 0.6
+
+            # Calculate confidence score
+            score = 40  # has verified transaction
+            txn_time = datetime.strptime(txn["transaction_time"], "%Y-%m-%d %H:%M:%S")
+            days_ago = (FIXED_NOW - txn_time).days
+            if days_ago <= 30:
+                score += 20
+            if fraud_type != "OTHER":
+                score += 15
+            if aftermath != "OTHER":
+                score += 15
+            if has_evidence:
+                score += 10
+            score = min(score, 100)
+            confidence_scores.append(score)
+            total_amount += txn["amount"]
+
+            report = {
+                "report_id": make_id("fraud_reports", report_idx),
+                "reporter_cif_no": reporter_cif,
+                "transaction_ref": txn["transaction_ref"],
+                "reported_account_no": cp_acc,
+                "reported_bank_code": cp_bank,
+                "reported_customer_cif": "",
+                "fraud_type": fraud_type,
+                "contact_channel": contact_channel,
+                "aftermath": aftermath,
+                "reason_text": f"Bi lua dao qua {contact_channel.lower()}, {aftermath.lower().replace('_', ' ')}",
+                "has_evidence": has_evidence,
+                "confidence_score": score,
+                "status": random.choice(["VALIDATED", "CONFIRMED"]) if score >= 60 else "SUBMITTED",
+                "created_at": random_timestamp(datetime(2026, 5, 1), FIXED_NOW).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            fraud_reports.append(report)
+            report_idx += 1
+
+        # Create/update reported_account entry
+        valid_count = len(reporters_used)
+        avg_conf = int(sum(confidence_scores) / len(confidence_scores)) if confidence_scores else 0
+
+        # Risk level rules
+        if valid_count >= 5 or avg_conf >= 80:
+            risk_level = "CRITICAL"
+            risk_score = 0.95
+        elif valid_count >= 3:
+            risk_level = "HIGH"
+            risk_score = 0.75
+        elif valid_count >= 2:
+            risk_level = "MEDIUM"
+            risk_score = 0.50
+        else:
+            risk_level = "LOW"
+            risk_score = 0.25
+
+        first_report_time = min(r["created_at"] for r in fraud_reports if r["reported_account_no"] == cp_acc)
+        last_report_time = max(r["created_at"] for r in fraud_reports if r["reported_account_no"] == cp_acc)
+
+        ra_record = {
+            "reported_account_id": make_id("reported_accounts", ra_idx),
+            "account_no": cp_acc,
+            "bank_code": cp_bank,
+            "linked_customer_cif": "",
+            "valid_report_count": valid_count,
+            "unique_reporter_count": len(reporters_used),
+            "total_reported_amount": total_amount,
+            "avg_confidence_score": avg_conf,
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "status": "ACTIVE",
+            "first_reported_at": first_report_time,
+            "last_reported_at": last_report_time,
+        }
+        reported_accounts_list.append(ra_record)
+        ra_map[(cp_acc, cp_bank)] = ra_record
+        ra_idx += 1
+
+    # Generate reported_customers for accounts that belong to our bank (simulated)
+    # Pick 3 random customers to be "reported customers"
+    reported_cust_cifs = random.sample(active_cifs[50:70], min(3, len(active_cifs[50:70])))
+    for cif in reported_cust_cifs:
+        num_accts = random.randint(1, 2)
+        num_reports = random.randint(2, 5)
+        total_amt = random.randint(10000000, 100000000)
+
+        if num_accts >= 2:
+            rl = "FROZEN"
+            rs = 0.70
+        else:
+            rl = "WATCH"
+            rs = 0.40
+
+        rc_record = {
+            "reported_customer_id": make_id("reported_customers", rc_idx),
+            "cif_no": cif,
+            "reported_account_count": num_accts,
+            "valid_report_count": num_reports,
+            "total_reported_amount": total_amt,
+            "risk_score": rs,
+            "risk_level": rl,
+            "status": "ACTIVE",
+            "created_at": random_timestamp(datetime(2026, 5, 1), FIXED_NOW).strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": random_timestamp(datetime(2026, 5, 15), FIXED_NOW).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        reported_customers_list.append(rc_record)
+        rc_map[cif] = rc_record
+        rc_idx += 1
+
+    # Generate fraud_decisions (simulating transfer screening logs)
+    fd_idx = 1
+    decisions_options = ["ALLOW", "WARN", "STEP_UP_AUTH", "HOLD", "BLOCK"]
+    # Create 15-20 fraud_decisions for various action_requests
+    transfer_actions = [a for a in action_requests if a["action_type"] == "TRANSFER"]
+    for action in random.sample(transfer_actions, min(18, len(transfer_actions))):
+        payload = json.loads(action["api_payload"]) if action["api_payload"] else {}
+        receiver_acc = payload.get("to_account_no", gen_account_no())
+        receiver_bank = payload.get("to_bank_code", random.choice(BANK_CODES))
+
+        # Check if receiver is in reported_accounts
+        ra_key = (receiver_acc, receiver_bank)
+        if ra_key in ra_map:
+            ra = ra_map[ra_key]
+            matched = ra["valid_report_count"]
+            risk_lvl = ra["risk_level"]
+            if risk_lvl == "CRITICAL":
+                decision = "BLOCK"
+            elif risk_lvl == "HIGH":
+                decision = "HOLD"
+            elif risk_lvl == "MEDIUM":
+                decision = "STEP_UP_AUTH"
+            else:
+                decision = "WARN"
+            rs = ra["risk_score"]
+        else:
+            matched = 0
+            risk_lvl = ""
+            decision = "ALLOW"
+            rs = 0.0
+
+        reason_codes = []
+        if matched > 0:
+            reason_codes.append(f"REPORTED_ACCOUNT_{risk_lvl}")
+        if action["risk_tier"] in ["ORANGE", "RED"]:
+            reason_codes.append("HIGH_RISK_ACTION")
+
+        fd = {
+            "decision_id": make_id("fraud_decisions", fd_idx),
+            "action_id": action["action_id"],
+            "receiver_account_no": receiver_acc,
+            "receiver_bank_code": receiver_bank,
+            "matched_report_count": matched,
+            "risk_score": rs,
+            "risk_level": risk_lvl if risk_lvl else "NONE",
+            "decision": decision,
+            "reason_codes": json.dumps(reason_codes, ensure_ascii=False),
+            "created_at": action["created_at"],
+        }
+        fraud_decisions_list.append(fd)
+        fd_idx += 1
+
+
+# ============================================================
 # VALIDATION
 # ============================================================
 
@@ -2074,6 +2304,8 @@ def main():
     generate_api_call_logs()
     print("  audit_logs...")
     generate_audit_logs()
+    print("  fraud_data...")
+    generate_fraud_data()
 
     # Write CSVs
     print("\nWriting CSV files...")
@@ -2114,6 +2346,25 @@ def main():
     write_csv("audit_logs.csv", audit_logs,
               ["audit_id", "action_id", "cif_no", "event_type", "actor", "event_payload", "created_at"])
 
+    write_csv("fraud_reports.csv", fraud_reports,
+              ["report_id", "reporter_cif_no", "transaction_ref", "reported_account_no", "reported_bank_code",
+               "reported_customer_cif", "fraud_type", "contact_channel", "aftermath", "reason_text",
+               "has_evidence", "confidence_score", "status", "created_at"])
+
+    write_csv("reported_accounts.csv", reported_accounts_list,
+              ["reported_account_id", "account_no", "bank_code", "linked_customer_cif",
+               "valid_report_count", "unique_reporter_count", "total_reported_amount",
+               "avg_confidence_score", "risk_score", "risk_level", "status",
+               "first_reported_at", "last_reported_at"])
+
+    write_csv("reported_customers.csv", reported_customers_list,
+              ["reported_customer_id", "cif_no", "reported_account_count", "valid_report_count",
+               "total_reported_amount", "risk_score", "risk_level", "status", "created_at", "updated_at"])
+
+    write_csv("fraud_decisions.csv", fraud_decisions_list,
+              ["decision_id", "action_id", "receiver_account_no", "receiver_bank_code",
+               "matched_report_count", "risk_score", "risk_level", "decision", "reason_codes", "created_at"])
+
     # Generate README
     print("  README.md...")
     generate_readme()
@@ -2137,6 +2388,10 @@ def main():
     print(f"  action_requests:         {len(action_requests):>6}")
     print(f"  api_call_logs:           {len(api_call_logs):>6}")
     print(f"  audit_logs:              {len(audit_logs):>6}")
+    print(f"  fraud_reports:           {len(fraud_reports):>6}")
+    print(f"  reported_accounts:       {len(reported_accounts_list):>6}")
+    print(f"  reported_customers:      {len(reported_customers_list):>6}")
+    print(f"  fraud_decisions:         {len(fraud_decisions_list):>6}")
     print(f"\nOutput: {OUTPUT_DIR.resolve()}")
 
 

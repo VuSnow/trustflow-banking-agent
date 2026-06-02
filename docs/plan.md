@@ -137,7 +137,70 @@ CREATE TABLE reported_accounts (
 );
 ```
 
-**Seed data:** 2 users, 3-5 beneficiaries per user, 50-100 transactions, 3-5 reported accounts.
+**Fraud detection tables (Phase 10):**
+```sql
+CREATE TABLE fraud_reports (
+    report_id TEXT PRIMARY KEY,
+    reporter_cif_no TEXT NOT NULL REFERENCES users(user_id),
+    transaction_ref TEXT,
+    reported_account_no TEXT NOT NULL,
+    reported_bank_code TEXT NOT NULL,
+    reported_customer_cif TEXT,
+    fraud_type TEXT CHECK(fraud_type IN ('SHOPPING_SCAM','INVESTMENT_SCAM','IMPERSONATION','DEPOSIT_SCAM','LOAN_SCAM','OTHER')),
+    contact_channel TEXT CHECK(contact_channel IN ('FACEBOOK','ZALO','TELEGRAM','WEBSITE','PHONE','OTHER')),
+    aftermath TEXT CHECK(aftermath IN ('BLOCKED_CONTACT','NO_GOODS','ASKED_MORE_MONEY','DISAPPEARED','OTHER')),
+    reason_text TEXT,
+    has_evidence INTEGER DEFAULT 0,
+    confidence_score INTEGER DEFAULT 0,
+    status TEXT CHECK(status IN ('SUBMITTED','VALIDATED','CONFIRMED','REJECTED')),
+    created_at TEXT
+);
+
+CREATE TABLE reported_accounts_v2 (
+    reported_account_id TEXT PRIMARY KEY,
+    account_no TEXT NOT NULL,
+    bank_code TEXT NOT NULL,
+    linked_customer_cif TEXT,
+    valid_report_count INTEGER DEFAULT 0,
+    unique_reporter_count INTEGER DEFAULT 0,
+    total_reported_amount INTEGER DEFAULT 0,
+    avg_confidence_score INTEGER DEFAULT 0,
+    risk_score REAL DEFAULT 0.0,
+    risk_level TEXT CHECK(risk_level IN ('LOW','MEDIUM','HIGH','CRITICAL')),
+    status TEXT CHECK(status IN ('ACTIVE','UNDER_REVIEW','CLEARED')),
+    first_reported_at TEXT,
+    last_reported_at TEXT,
+    UNIQUE(account_no, bank_code)
+);
+
+CREATE TABLE reported_customers (
+    reported_customer_id TEXT PRIMARY KEY,
+    cif_no TEXT NOT NULL REFERENCES users(user_id),
+    reported_account_count INTEGER DEFAULT 0,
+    valid_report_count INTEGER DEFAULT 0,
+    total_reported_amount INTEGER DEFAULT 0,
+    risk_score REAL DEFAULT 0.0,
+    risk_level TEXT CHECK(risk_level IN ('WATCH','FROZEN','BLOCKED','CLEARED')),
+    status TEXT CHECK(status IN ('ACTIVE','UNDER_REVIEW','CLEARED')),
+    created_at TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE fraud_decisions (
+    decision_id TEXT PRIMARY KEY,
+    action_id TEXT,
+    receiver_account_no TEXT NOT NULL,
+    receiver_bank_code TEXT NOT NULL,
+    matched_report_count INTEGER DEFAULT 0,
+    risk_score REAL,
+    risk_level TEXT,
+    decision TEXT CHECK(decision IN ('ALLOW','WARN','STEP_UP_AUTH','HOLD','BLOCK')),
+    reason_codes TEXT,  -- JSON array
+    created_at TEXT
+);
+```
+
+**Seed data:** 2 users, 3-5 beneficiaries per user, 50-100 transactions, 3-5 reported accounts, 2-3 fraud_reports (seeded for screening demo), 2-3 reported_accounts_v2 entries with varied risk_levels.
 
 ---
 
@@ -204,6 +267,31 @@ Plan: [] (account already provided, no resolution needed)
 Draft: ActionDraft(amount=50000000, recipient_account="6666666666")
 Guardian: checks reported_accounts table → RED (scam account + high amount)
 → BLOCKED. User cannot confirm.
+```
+
+### Scenario 6: User reports a fraud account
+```text
+User: "Tôi muốn báo cáo STK 9876543210 ngân hàng TCB lừa đảo tôi"
+Extract: operation=REPORT_FRAUD_ACCOUNT, reported_account_no="9876543210", reported_bank_code="TCB"
+FraudVerificationAgent: query transactions → found 1 matching txn (15M, 3 days ago)
+Multi-turn: fraud_type=SHOPPING_SCAM, channel=FACEBOOK, aftermath=BLOCKED_CONTACT, evidence=yes
+Confidence: 100 (has txn + recent + clear type + clear aftermath + has evidence)
+Draft: FraudReportDraft(...)
+Guardian: GREEN (protective action)
+Friction: bank_confirm
+→ User confirms → FraudReportExecutor inserts report + updates risk
+```
+
+### Scenario 7: Transfer to previously-reported account (screening)
+```text
+User: "Chuyển 10tr cho TK 9876543210 TCB"
+Extract: action=TRANSFER_MONEY, amount=10000000, recipient_account="9876543210", recipient_bank="TCB"
+Plan: [] (account provided)
+Draft: ActionDraft(amount=10000000, recipient_account="9876543210", recipient_bank="TCB")
+Guardian: checks reported_accounts_v2 → risk_level=MEDIUM (2 valid reports)
+→ WARN + STEP_UP_AUTH
+Message: "⚠️ Tài khoản này từng bị báo cáo lừa đảo. Bạn có chắc chắn?"
+→ User confirms + OTP → Executed (with fraud_decisions logged)
 ```
 
 ---
@@ -1298,18 +1386,263 @@ pytest tests/test_e2e.py -v
 
 ---
 
-## Phase 10: Frontend
+## Phase 10: Fraud Report Agent
 
-> Goal: Streamlit UI with chat + confirm/OTP/block modals + audit trace viewer.
+> Goal: User can report fraud accounts via conversational chat. Multi-turn flow with
+> verification, context questions, confidence scoring, and risk update.
 
-### Step 10.1: `frontend/app.py` — main layout
-### Step 10.2: `frontend/components/chat.py` — chat interface
-### Step 10.3: `frontend/components/bank_confirm.py` — confirm modal (GREEN)
-### Step 10.4: `frontend/components/otp_modal.py` — OTP input (YELLOW)
-### Step 10.5: `frontend/components/blocked_warning.py` — block explanation (RED)
-### Step 10.6: `frontend/components/audit_viewer.py` — expandable trace: plan → execution → guardian → friction
+### Step 10.1: Intent — add FRAUD_REPORT
 
-**Test:** `streamlit run frontend/app.py` → all demo scenarios work visually.
+**File:** `backend/models.py` — update IntentResult.task_type:
+```python
+task_type: Literal["QA", "DATA_QUERY", "TRANSACTION", "CARD_OPERATION", "ACCOUNT_OPERATION", "LOAN_OPERATION", "FRAUD_REPORT"]
+```
+
+**File:** `backend/prompts/intent.py` — add FRAUD_REPORT classification examples.
+
+### Step 10.2: Fraud-specific models
+
+**File:** `backend/models.py` — thêm:
+```python
+class FraudReportExtraction(BaseModel):
+    """Extracted from user message when reporting fraud."""
+    operation: Literal["REPORT_FRAUD_ACCOUNT"] = "REPORT_FRAUD_ACCOUNT"
+    reported_account_no: str | None = None
+    reported_bank_code: str | None = None
+    reason_hint: str | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+
+class FraudContextAnswers(BaseModel):
+    """Collected during multi-turn fraud context questions."""
+    fraud_type: str | None = None        # SHOPPING_SCAM, INVESTMENT_SCAM, etc.
+    contact_channel: str | None = None   # FACEBOOK, ZALO, etc.
+    aftermath: str | None = None         # BLOCKED_CONTACT, NO_GOODS, etc.
+    has_evidence: bool = False
+    selected_transaction_ref: str | None = None
+
+class FraudReportDraft(BaseModel):
+    """Draft for FraudReportExecutor."""
+    operation: str = "REPORT_FRAUD_ACCOUNT"
+    reported_account_no: str
+    reported_bank_code: str
+    transaction_ref: str | None = None
+    fraud_type: str | None = None
+    contact_channel: str | None = None
+    aftermath: str | None = None
+    has_evidence: bool = False
+    confidence_score: int = 0
+    reason_text: str | None = None
+```
+
+### Step 10.3: FraudVerificationAgent (sub-agent)
+
+**File:** `backend/agents/sub_agents/fraud_verification.py`
+
+```python
+class FraudVerificationAgent:
+    """Verifies user has real transactions with reported account.
+
+    task_type: "verify_transaction_relationship"
+    constraints: {user_id, counterparty_account_no, counterparty_bank_code}
+
+    Logic:
+    1. Query transactions WHERE user_id = ? AND counterparty_account_no = ?
+       AND counterparty_bank_code = ? AND direction = 'OUT' AND status = 'SUCCESS'
+    2. If 0 results → status="no_relationship"
+    3. If results → status="verified", returns list of matching transactions
+    """
+
+    async def execute_task(self, task: AgentTask) -> AgentTaskResult:
+        ...
+```
+
+### Step 10.4: FraudReportAgent (domain agent)
+
+**File:** `backend/agents/fraud_report.py`
+
+```python
+class FraudReportAgent:
+    """Domain agent for FRAUD_REPORT intent.
+
+    Multi-turn conversational flow:
+    Turn 1: Extract reported_account_no + bank_code → verify transaction relationship
+    Turn 2: Show matching transactions, ask user to select
+    Turn 3-4: Ask fraud context questions (fraud_type, contact_channel, aftermath, evidence)
+    Turn 5: Calculate confidence, build draft
+
+    Uses session store to track multi-turn state.
+    """
+
+    async def run(self, message: str, user_id: str, session_id: str) -> DomainAgentOutput:
+        # 1. Check session for in-progress fraud report
+        # 2. If new: extract → verify → show transactions
+        # 3. If in-progress: collect next answer → advance state
+        # 4. When all context collected: calculate confidence → build draft
+        ...
+
+    def _calculate_confidence(self, context: FraudContextAnswers, transaction_age_days: int) -> int:
+        """Rule-based confidence scoring.
+        +40: has verified transaction
+        +20: transaction within 30 days
+        +15: fraud_type is clear (not OTHER)
+        +15: aftermath is clear (not OTHER)
+        +10: has evidence
+        """
+        score = 40  # base: verified transaction exists
+        if transaction_age_days <= 30:
+            score += 20
+        if context.fraud_type and context.fraud_type != "OTHER":
+            score += 15
+        if context.aftermath and context.aftermath != "OTHER":
+            score += 15
+        if context.has_evidence:
+            score += 10
+        return min(score, 100)
+```
+
+### Step 10.5: FraudReportExecutor
+
+**File:** `backend/executors/fraud_report.py`
+
+```python
+class FraudReportExecutor:
+    """Executes fraud report: insert report + update risk signals.
+
+    Steps:
+    1. INSERT into fraud_reports (status=VALIDATED)
+    2. UPSERT reported_accounts_v2:
+       - Increment valid_report_count, unique_reporter_count
+       - Add transaction amount to total_reported_amount
+       - Recalculate avg_confidence_score
+       - Recalculate risk_level based on rules
+    3. IF same-bank (reported_bank = our bank):
+       - Lookup customer by account
+       - UPSERT reported_customers (increment counters, recalculate risk)
+    """
+
+    def execute(self, draft: FraudReportDraft, user_id: str) -> dict:
+        ...
+
+    def _calculate_account_risk_level(self, report_count: int, unique_reporters: int) -> str:
+        """
+        1 report → LOW
+        2 reports → MEDIUM
+        3-4 reports from 3+ users → HIGH
+        5+ reports OR avg_confidence >= 80 → CRITICAL
+        """
+        ...
+```
+
+### Step 10.6: Wire into /chat + multi-turn session
+
+**File:** `backend/main.py` — add to DOMAIN_AGENT_MAP:
+```python
+DOMAIN_AGENT_MAP = {
+    "TRANSACTION": transaction_agent,
+    "FRAUD_REPORT": fraud_report_agent,
+}
+```
+
+Multi-turn state stored in SessionStore (session_id scoped).
+
+### Step 10.7: Tests
+
+```bash
+# Test: report with verified transaction → confidence 100
+# Test: report without transaction → rejected
+# Test: multi-turn context collection
+# Test: FraudReportExecutor updates reported_accounts risk
+pytest tests/test_fraud_report.py -v
+```
+
+---
+
+## Phase 11: Transaction Screening (Guardian Fraud Check)
+
+> Goal: When Guardian evaluates a TRANSFER ActionDraft, check fraud risk of receiver
+> using reported_accounts_v2 and reported_customers. Log fraud_decisions.
+
+### Step 11.1: Update Guardian with fraud screening
+
+**File:** `backend/services/guardian.py` — add to evaluate():
+
+```python
+# After existing hard rules, before soft scoring:
+
+# Fraud screening: check receiver against reported_accounts_v2
+reported = self._check_reported_account(
+    draft.recipient_account, draft.recipient_bank
+)
+if reported:
+    if reported["risk_level"] == "CRITICAL":
+        return GuardianDecision(decision="BLOCK", risk_tier="RED",
+            reasons=[f"Tài khoản nhận đã bị xác nhận lừa đảo ({reported['valid_report_count']} báo cáo)"])
+    elif reported["risk_level"] == "HIGH":
+        score += 0.7
+        reasons.append(f"Tài khoản nhận có {reported['valid_report_count']} báo cáo lừa đảo")
+    elif reported["risk_level"] == "MEDIUM":
+        score += 0.5
+        reasons.append(f"Tài khoản nhận từng bị báo cáo ({reported['valid_report_count']} lần)")
+    elif reported["risk_level"] == "LOW":
+        score += 0.3
+        reasons.append("Tài khoản nhận có 1 báo cáo lừa đảo chưa xác nhận")
+
+# Also check reported_customers if same-bank
+reported_customer = self._check_reported_customer(draft.recipient_account)
+if reported_customer and reported_customer["risk_level"] in ("FROZEN", "BLOCKED"):
+    return GuardianDecision(decision="BLOCK", risk_tier="RED",
+        reasons=["Chủ tài khoản nhận đang bị đóng băng/chặn do nhiều báo cáo gian lận"])
+```
+
+### Step 11.2: Log fraud_decisions
+
+```python
+# In Guardian or AgentRuntime, after screening:
+def _log_fraud_decision(self, action_id, receiver_account, receiver_bank, risk_level, decision):
+    # INSERT INTO fraud_decisions (...)
+    ...
+```
+
+### Step 11.3: ChatResponse fraud warning
+
+When decision = WARN:
+```python
+ChatResponse(
+    status="pending_auth",
+    message="⚠️ Cảnh báo: Tài khoản này từng bị báo cáo lừa đảo bởi người dùng khác. Bạn có chắc chắn muốn tiếp tục?",
+    risk_tier="YELLOW",
+    auth_required="otp",
+    ...
+)
+```
+
+### Step 11.4: Tests
+
+```bash
+# Test: transfer to CRITICAL account → BLOCK
+# Test: transfer to HIGH account → ORANGE + OTP
+# Test: transfer to MEDIUM account → WARN + STEP_UP
+# Test: transfer to LOW account → WARN only
+# Test: transfer to clean account → no fraud warning
+# Test: fraud_decisions logged for every screened transfer
+pytest tests/test_fraud_screening.py -v
+```
+
+---
+
+## Phase 12: Frontend
+
+> Goal: Streamlit UI with chat + confirm/OTP/block modals + audit trace viewer + fraud report flow.
+
+### Step 12.1: `frontend/app.py` — main layout
+### Step 12.2: `frontend/components/chat.py` — chat interface
+### Step 12.3: `frontend/components/bank_confirm.py` — confirm modal (GREEN)
+### Step 12.4: `frontend/components/otp_modal.py` — OTP input (YELLOW)
+### Step 12.5: `frontend/components/blocked_warning.py` — block explanation (RED)
+### Step 12.6: `frontend/components/fraud_report.py` — fraud report multi-turn UI
+### Step 12.7: `frontend/components/audit_viewer.py` — expandable trace: plan → execution → guardian → friction
+
+**Test:** `streamlit run frontend/app.py` → all 7 demo scenarios work visually.
 
 ---
 
@@ -1351,7 +1684,9 @@ class DataQueryAgent:
 | 7 | Guardian + Friction + PendingAction + minimal audit | Risk tiers, block/allow |
 | 8 | Confirm/OTP + Executor | Full lifecycle |
 | 9 | Full AuditEntry + E2E tests | 5 scenarios pass |
-| 10 | Frontend | Visual demo |
+| 10 | FraudReportAgent + FraudVerificationAgent + FraudReportExecutor | **Fraud report flow** |
+| 11 | Transaction Screening (Guardian fraud check + fraud_decisions) | **Real-time fraud protection** |
+| 12 | Frontend | Visual demo |
 
 ---
 
@@ -1359,14 +1694,16 @@ class DataQueryAgent:
 
 1. **Orchestrator is a thin router.** Only maps intent → domain agent. No business logic.
 2. **Dynamic planning is resolution-only.** LLM planner CANNOT generate execution/approval steps.
-3. **Each domain agent has an allowlist.** TransactionAgent can only call: recipient_resolution, text2sql.
+3. **Each domain agent has an allowlist.** TransactionAgent can only call: recipient_resolution, text2sql. FraudReportAgent can only call: fraud_verification.
 4. **Text2SQL is evidence-retrieval only.** SELECT only. Validated by SQLGuardian. user_id injected by backend.
 5. **RecipientResolutionAgent auto-resolves only with exactly 1 high-confidence verified candidate.** Multiple candidates or low confidence → clarification_needed.
 6. **Guardian is mandatory for all ActionDrafts.** No bypass, even for GREEN tier.
-7. **Typed models at boundaries.** TransactionExtraction, ActionDraft, GuardianDecision — never raw dict.
+7. **Typed models at boundaries.** TransactionExtraction, ActionDraft, FraudReportDraft, GuardianDecision — never raw dict.
 8. **Fixed outer control plane.** Guardian → Friction → PendingAction → Executor is never LLM-controlled.
 9. **Never trust LLM-generated user_id.** SQLExecutor always injects from backend auth context.
 10. **Text2SQL must not:** execute money movement, approve transactions, choose recipients, bypass Guardian, generate DML/DDL.
+11. **Fraud report requires verified transaction.** Agent MUST verify user has real outgoing transaction to reported account before creating report. No report without evidence.
+12. **Transaction screening is mandatory.** Every TRANSFER ActionDraft must check reported_accounts_v2 before Guardian decision. fraud_decisions logged for every screened transfer.
 
 ---
 

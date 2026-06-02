@@ -19,6 +19,7 @@ Task types:
 - CARD_OPERATION: user wants to manage a bank card.
 - ACCOUNT_OPERATION: user wants to open, close, update, or manage a bank account or beneficiary.
 - LOAN_OPERATION: user wants to apply for, repay, check, or manage a loan.
+- FRAUD_REPORT: user wants to report a scam, fraud, or suspicious transaction they were a victim of.
 
 Operations:
 
@@ -48,6 +49,10 @@ For LOAN_OPERATION:
 - REPAY_LOAN: repay a loan.
 - VIEW_LOAN_INFO: view loan balance, repayment schedule, interest, debt, or loan details.
 
+For FRAUD_REPORT:
+- REPORT_FRAUD: report a scam, fraud, or suspicious transfer the user was a victim of.
+- CHECK_FRAUD_STATUS: check the status of a previously submitted fraud report.
+
 For QA and DATA_QUERY:
 - Use operation = null unless there is a clearly useful operation label.
 - Do not force an operation.
@@ -57,17 +62,18 @@ Routing rules:
 - If the user wants to lock, unlock, activate, replace, or change card settings → CARD_OPERATION.
 - If the user wants to open, close, update, or manage an account/beneficiary → ACCOUNT_OPERATION.
 - If the user wants to apply for, repay, or manage a loan → LOAN_OPERATION.
+- If the user wants to report fraud, scam, or a suspicious transaction → FRAUD_REPORT.
 - If the user asks to check, view, search, summarize, compare, or analyze their own banking data → DATA_QUERY.
 - If the user asks about rules, policies, fees, interest rates, product information, required documents, or how something works → QA.
 
 Priority rule:
 If multiple intents appear, choose the highest-impact task type:
-TRANSACTION > CARD_OPERATION > ACCOUNT_OPERATION > LOAN_OPERATION > DATA_QUERY > QA.
+FRAUD_REPORT > TRANSACTION > CARD_OPERATION > ACCOUNT_OPERATION > LOAN_OPERATION > DATA_QUERY > QA.
 
 Output schema:
 {
-  "task_type": "QA | DATA_QUERY | TRANSACTION | CARD_OPERATION | ACCOUNT_OPERATION | LOAN_OPERATION",
-  "operation": "TRANSFER_MONEY | BILL_PAYMENT | TOP_UP | LOCK_CARD | UNLOCK_CARD | ACTIVATE_CARD | REISSUE_CARD | CHANGE_CARD_LIMIT | VIEW_CARD_INFO | OPEN_ACCOUNT | CLOSE_ACCOUNT | UPDATE_ACCOUNT_INFO | MANAGE_BENEFICIARY | VIEW_ACCOUNT_INFO | APPLY_LOAN | CHECK_LOAN_STATUS | REPAY_LOAN | VIEW_LOAN_INFO | null",
+  "task_type": "QA | DATA_QUERY | TRANSACTION | CARD_OPERATION | ACCOUNT_OPERATION | LOAN_OPERATION | FRAUD_REPORT",
+  "operation": "TRANSFER_MONEY | BILL_PAYMENT | TOP_UP | LOCK_CARD | UNLOCK_CARD | ACTIVATE_CARD | REISSUE_CARD | CHANGE_CARD_LIMIT | VIEW_CARD_INFO | OPEN_ACCOUNT | CLOSE_ACCOUNT | UPDATE_ACCOUNT_INFO | MANAGE_BENEFICIARY | VIEW_ACCOUNT_INFO | APPLY_LOAN | CHECK_LOAN_STATUS | REPAY_LOAN | VIEW_LOAN_INFO | REPORT_FRAUD | CHECK_FRAUD_STATUS | null",
   "confidence": 0.0,
   "reason": "short reason in English"
 }
@@ -189,6 +195,24 @@ Output:
   "operation": "TRANSFER_MONEY",
   "confidence": 0.99,
   "reason": "User wants to initiate a money transfer."
+}
+
+User: "Tôi bị lừa chuyển tiền cho người quen trên Zalo"
+Output:
+{
+  "task_type": "FRAUD_REPORT",
+  "operation": "REPORT_FRAUD",
+  "confidence": 0.97,
+  "reason": "User reports being a victim of a scam transfer."
+}
+
+User: "Báo cáo lừa đảo giao dịch hôm qua"
+Output:
+{
+  "task_type": "FRAUD_REPORT",
+  "operation": "REPORT_FRAUD",
+  "confidence": 0.96,
+  "reason": "User wants to report a fraudulent transaction."
 }
 """
 

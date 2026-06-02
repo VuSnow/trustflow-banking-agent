@@ -167,6 +167,7 @@ Orchestrator classifies **one** high-level `task_type` and routes to the correct
 | CARD_OPERATION | CardAgent | LOCK_CARD, UNLOCK_CARD, ACTIVATE_CARD, REISSUE_CARD, CHANGE_CARD_LIMIT, VIEW_CARD_INFO |
 | ACCOUNT_OPERATION | AccountAgent | OPEN_ACCOUNT, CLOSE_ACCOUNT, UPDATE_ACCOUNT_INFO, MANAGE_BENEFICIARY, VIEW_ACCOUNT_INFO |
 | LOAN_OPERATION | LoanAgent | APPLY_LOAN, CHECK_LOAN_STATUS, REPAY_LOAN, VIEW_LOAN_INFO |
+| FRAUD_REPORT | FraudReportAgent | REPORT_FRAUD_ACCOUNT |
 
 Orchestrator does **not**:
 - Extract entities from the message
@@ -341,6 +342,14 @@ Calling Agent (Domain Agent or sub-agent)
 │  │   → Delegate to PolicyRetrieverAgent                          │  │
 │  │   → Generate grounded answer with citation                    │  │
 │  │                                                               │  │
+│  │ • FraudReportAgent:                                           │  │
+│  │   → Parse fraud report info (LLM extract)                     │  │
+│  │   → Delegate to FraudVerificationAgent (check transactions)   │  │
+│  │   → Multi-turn: ask fraud context questions                   │  │
+│  │   → Calculate confidence score (rule-based)                   │  │
+│  │   → Build fraud_report_draft                                  │  │
+│  │   → Return draft to agent runtime                             │  │
+│  │                                                               │  │
 │  │ • AccountAgent / LoanAgent (same pattern)                     │  │
 │  └───────────────────────────┬───────────────────────────────────┘  │
 │                              │                                      │
@@ -354,6 +363,7 @@ Calling Agent (Domain Agent or sub-agent)
 │  │ • AccountProfileAgent       → resolve account info            │  │
 │  │ • LoanInfoAgent             → lookup loan details             │  │
 │  │ • PolicyRetrieverAgent      → retrieve policy docs + version  │  │
+│  │ • FraudVerificationAgent    → verify user has txn with STK    │  │
 │  │ • Text2SQLAgent             → generate SQL only               │  │
 │  │                                                               │  │
 │  │ ⚠️  Sub-agents prepare/retrieve only.                         │  │
@@ -379,6 +389,8 @@ Calling Agent (Domain Agent or sub-agent)
 │  │                                                               │  │
 │  │ Layer 1: HARD RULES (deterministic, instant decision)         │  │
 │  │   • Recipient in reported_accounts → RED                      │  │
+│  │   • Recipient risk_level = CRITICAL → RED                     │  │
+│  │   • Recipient risk_level = HIGH → ORANGE minimum              │  │
 │  │   • Amount > daily_limit → BLOCK                              │  │
 │  │   • Pressure/threat keywords → ORANGE minimum                 │  │
 │  │   • SQL contains DML/DDL → REJECT                             │  │
@@ -405,6 +417,7 @@ Calling Agent (Domain Agent or sub-agent)
 │  │ • SQLExecutor         → run parameterized read-only query     │  │
 │  │ • AccountExecutor     → account operations                    │  │
 │  │ • LoanExecutor        → loan operations                       │  │
+│  │ • FraudReportExecutor → insert fraud_reports, update risk     │  │
 │  │                                                               │  │
 │  │ ⚠️  Executors ONLY run after Guardian approves + auth passes. │  │
 │  │ ⚠️  Idempotency key prevents double-execution.                │  │
@@ -423,6 +436,8 @@ Calling Agent (Domain Agent or sub-agent)
 │  │ • users.json (profiles + behavioral baselines)                │  │
 │  │ • beneficiaries.json (saved recipients per user)              │  │
 │  │ • reported_accounts.json (scam registry)                      │  │
+│  │ • fraud_reports (user fraud reports with evidence)             │  │
+│  │ • reported_customers (customer-level fraud risk signals)       │  │
 │  │ • transactions.db (SQLite, pre-seeded)                        │  │
 │  │ • policies/*.md (versioned policy docs)                       │  │
 │  └───────────────────────────────────────────────────────────────┘  │
@@ -707,6 +722,164 @@ Response:
 | REISSUE_CARD | YELLOW (OTP) | Address verification if applicable |
 | CHANGE_CARD_LIMIT | ORANGE (challenge + OTP) | High impact on spending |
 | VIEW_CARD_INFO | GREEN (session-authenticated, masked output only) | Read-only |
+
+---
+
+## 10b. FraudReportAgent Flow
+
+### Example: "Tôi muốn báo cáo số tài khoản 123456789 tại ngân hàng VCB lừa đảo tôi"
+
+```text
+1. Orchestrator classifies:
+   task_type = FRAUD_REPORT
+   route → FraudReportAgent
+
+2. FraudReportAgent parses (LLM extract):
+   operation = REPORT_FRAUD_ACCOUNT
+   reported_account_no = "123456789"
+   reported_bank_code = "VCB"
+   reason_hint = "lừa đảo"
+
+3. FraudReportAgent delegates to FraudVerificationAgent:
+   task: "verify_transaction_relationship"
+   constraints: {
+     user_id: "u1",
+     counterparty_account_no: "123456789",
+     counterparty_bank_code: "VCB"
+   }
+
+4. FraudVerificationAgent:
+   → Query transactions WHERE cif_no = :user_cif
+     AND counterparty_account_no = :reported_account
+     AND counterparty_bank_code = :reported_bank
+     AND direction = 'OUT'
+     AND status = 'SUCCESS'
+   → If 0 results: return {status: "no_relationship"}
+   → If results found: return {status: "verified", transactions: [...]}
+
+5. If no_relationship:
+   FraudReportAgent returns:
+   "Không tìm thấy giao dịch nào giữa bạn và tài khoản 123456789 (VCB).
+    Chưa thể tạo báo cáo gian lận chính thức."
+   → End flow.
+
+6. If verified (has transactions):
+   FraudReportAgent shows matching transactions:
+   "Tôi tìm thấy 2 giao dịch đến tài khoản này:
+    1. 15,000,000đ ngày 20/05/2026 - 'Đặt cọc mua hàng'
+    2. 5,000,000đ ngày 22/05/2026 - 'Chuyển thêm phí ship'
+    Bạn muốn report giao dịch nào? (1, 2, hoặc cả hai)"
+
+7. User selects → FraudReportAgent asks fraud context (multi-turn):
+
+   Q1: "Bạn chuyển tiền vì lý do gì?"
+       Options: Mua hàng / Đặt cọc / Đầu tư / Vay tiền / Người quen giả danh / Khác
+   → User: "Mua hàng"
+
+   Q2: "Bạn bị liên hệ qua kênh nào?"
+       Options: Facebook / Zalo / Telegram / Website / Điện thoại / Khác
+   → User: "Facebook"
+
+   Q3: "Sau khi chuyển tiền, chuyện gì xảy ra?"
+       Options: Bị chặn liên lạc / Không nhận được hàng / Bị yêu cầu thêm tiền / Link biến mất / Khác
+   → User: "Bị chặn liên lạc"
+
+   Q4: "Bạn có bằng chứng không?"
+       Options: Có ảnh tin nhắn / Có số điện thoại-link / Không có
+   → User: "Có ảnh tin nhắn"
+
+8. FraudReportAgent calculates confidence_score:
+   +40: has verified transaction
+   +20: transaction within 30 days
+   +15: fraud_type clear (SHOPPING_SCAM)
+   +15: aftermath clear (BLOCKED_CONTACT)
+   +10: has evidence
+   = 100 → CRITICAL confidence
+
+9. FraudReportAgent builds fraud_report_draft:
+   {
+     operation: "REPORT_FRAUD_ACCOUNT",
+     reported_account_no: "123456789",
+     reported_bank_code: "VCB",
+     transaction_ref: "TXN202605150001",
+     fraud_type: "SHOPPING_SCAM",
+     contact_channel: "FACEBOOK",
+     aftermath: "BLOCKED_CONTACT",
+     has_evidence: true,
+     confidence_score: 100,
+     reason_text: "Mua hàng qua Facebook, chuyển 15tr đặt cọc, bị chặn liên lạc"
+   }
+
+10. Guardian validates:
+    - FRAUD_REPORT is a protective action
+    - confidence_score >= 40 (has real transaction evidence)
+    - score = 0.0 → GREEN
+
+11. FrictionRouter: bank_confirm (protective action, minimal friction)
+
+12. User confirms → FraudReportExecutor:
+    a. INSERT fraud_reports (status = VALIDATED)
+    b. UPSERT reported_accounts:
+       - Increment valid_report_count, unique_reporter_count
+       - Add to total_reported_amount
+       - Recalculate risk_score and risk_level
+    c. IF same-bank (reported_bank = our bank):
+       - Lookup customer by account → get cif_no
+       - UPSERT reported_customers
+    d. INSERT fraud_decisions log
+
+13. Response:
+    "Báo cáo gian lận đã được ghi nhận. Tài khoản 123456789 (VCB) đã được
+     đánh dấu để bảo vệ người dùng khác. Cảm ơn bạn đã báo cáo."
+
+14. Audit.log(full fraud report trace)
+```
+
+### Transaction Screening (integrated with Guardian):
+
+When any TRANSFER action is evaluated by Guardian:
+
+```text
+Guardian.evaluate(draft):
+  1. Check reported_accounts:
+     SELECT risk_level, valid_report_count, status
+     FROM reported_accounts
+     WHERE account_no = draft.recipient_account
+       AND bank_code = draft.recipient_bank
+       AND status = 'ACTIVE'
+
+  2. If found:
+     - risk_level = LOW (1-2 reports) → WARN (+0.3 to risk_score)
+     - risk_level = MEDIUM (3-4 reports) → STEP_UP_AUTH (+0.5)
+     - risk_level = HIGH (5+ reports) → ORANGE minimum (+0.7)
+     - risk_level = CRITICAL (confirmed) → RED (hard block)
+
+  3. Check reported_customers (if same-bank):
+     SELECT risk_level FROM reported_customers
+     WHERE cif_no = (SELECT cif_no FROM accounts WHERE account_no = draft.recipient_account)
+
+  4. Log fraud_decisions:
+     INSERT INTO fraud_decisions (decision, risk_level, reason_codes, ...)
+
+  5. If WARN decision:
+     Message: "⚠️ Cảnh báo: Tài khoản này từng bị báo cáo lừa đảo bởi
+              người dùng khác. Bạn có chắc chắn muốn tiếp tục?"
+```
+
+### Fraud risk_level calculation rules (hackathon):
+
+```text
+reported_accounts.risk_level:
+  1 valid report                    → LOW
+  2 valid reports                   → MEDIUM
+  3-4 valid reports from 3+ users   → HIGH
+  5+ valid reports OR confirmed     → CRITICAL
+
+reported_customers.risk_level:
+  1 reported account                → WATCH
+  2+ reported accounts              → FROZEN (auto-freeze)
+  Confirmed fraud on any account    → BLOCKED
+```
 
 ---
 
@@ -1053,6 +1226,7 @@ trustflow-banking-agent/
 │   │   ├── loan.py                     # LoanAgent
 │   │   ├── data_query.py              # DataQueryAgent
 │   │   ├── qa.py                       # QAAgent
+│   │   ├── fraud_report.py            # FraudReportAgent (multi-turn fraud reporting)
 │   │   │
 │   │   └── sub_agents/                 # Sub-agents (retrieve/prepare only)
 │   │       ├── __init__.py
@@ -1063,6 +1237,7 @@ trustflow-banking-agent/
 │   │       ├── account_profile.py      # AccountProfileAgent
 │   │       ├── loan_info.py            # LoanInfoAgent
 │   │       ├── policy_retriever.py     # PolicyRetrieverAgent
+│   │       ├── fraud_verification.py   # FraudVerificationAgent (verify txn relationship)
 │   │       └── text2sql.py             # Text2SQLAgent (generate SQL only)
 │   │
 │   ├── services/                        # Infrastructure services
@@ -1079,6 +1254,7 @@ trustflow-banking-agent/
 │   │   ├── card.py                    # CardExecutor
 │   │   ├── account.py                 # AccountExecutor
 │   │   ├── loan.py                    # LoanExecutor
+│   │   ├── fraud_report.py            # FraudReportExecutor (insert report + update risk)
 │   │   └── sql.py                     # SQLExecutor (read-only query execution)
 │   │
 │   ├── policies/                        # Workflow policies (what agents can do)

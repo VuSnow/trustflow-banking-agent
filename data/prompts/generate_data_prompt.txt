@@ -27,7 +27,8 @@ Database chỉ dùng để:
 1. Lưu read model/lịch sử giao dịch để Text2SQL agent truy vấn.
 2. Lưu thông tin cần thiết để agent tạo API payload: accounts, beneficiaries, billers, cards.
 3. Lưu action draft, api payload, api call log, audit log.
-4. Demo các workflow chuyển tiền, nạp điện thoại, thanh toán hóa đơn, giao dịch thẻ, risk check.
+4. Lưu fraud report và risk signal cho transaction screening.
+5. Demo các workflow chuyển tiền, nạp điện thoại, thanh toán hóa đơn, giao dịch thẻ, risk check, báo cáo lừa đảo, transaction screening.
 
 Không cho agent tự "thực hiện giao dịch" bằng cách sửa bảng transactions.
 transactions là transaction history/read model.
@@ -47,7 +48,7 @@ Script phải:
 - Dùng fixed current time:
   - FIXED_NOW = datetime(2026, 6, 1, 12, 0, 0)
   - Không dùng datetime.now().
-- Output 12 CSV files + 1 README.md vào folder `./mock_data/`.
+- Output 16 CSV files + 1 README.md vào folder `./mock_data/`.
 - Nếu folder/file đã tồn tại, overwrite safely.
 - Tự tạo folder nếu chưa tồn tại.
 - Mỗi CSV có header.
@@ -63,6 +64,7 @@ Script phải:
   customers → accounts → cards → beneficiaries → merchants → billers
   → customer_biller_accounts → transaction_categories → transactions
   → action_requests → api_call_logs → audit_logs
+  → fraud_reports → reported_accounts → reported_customers → fraud_decisions
 
 ==================================================
 ID STRATEGY
@@ -95,6 +97,10 @@ ROW COUNTS
 - action_requests: 120
 - api_call_logs: chỉ tạo cho EXECUTED và FAILED actions, expected khoảng 65-75 rows
 - audit_logs: khoảng 600, 3-7 per action_request
+- fraud_reports: khoảng 8-15, báo cáo lừa đảo từ customers
+- reported_accounts: khoảng 8, aggregate risk per reported account
+- reported_customers: khoảng 3-5, aggregate risk per reported CIF
+- fraud_decisions: khoảng 15-20, kết quả screening cho transfers
 
 ==================================================
 BANK CODE → NAME MAPPING
@@ -628,6 +634,127 @@ Typical timeline:
 9. ACTION_EXECUTED / ACTION_FAILED / ACTION_BLOCKED
 
 ==================================================
+TABLE 13: fraud_reports
+==================================================
+
+Purpose:
+Lưu báo cáo lừa đảo từ user. Khi khách hàng phát hiện bị lừa đảo, agent tiếp nhận và tạo fraud report.
+
+Columns:
+
+report_id               UUID        PK.
+reporter_cif_no         string      FK → customers.cif_no. Người báo cáo.
+transaction_ref         string|null FK → transactions.transaction_ref. Giao dịch liên quan.
+reported_account_no     string      Số tài khoản bị báo cáo.
+reported_bank_code      string      Bank code tài khoản bị báo cáo. Từ BANK_MAP.
+reported_customer_cif   string|null CIF người bị báo cáo, nếu biết.
+fraud_type              enum        SCAM_TRANSFER(40%) | FAKE_INVESTMENT(20%) | IMPERSONATION(20%) | PHISHING(10%) | OTHER(10%)
+contact_channel         enum        ZALO(30%) | FACEBOOK(25%) | SMS(20%) | PHONE_CALL(15%) | OTHER(10%)
+aftermath               enum        MONEY_LOST(50%) | PARTIAL_RECOVERY(20%) | NO_LOSS(15%) | PENDING(15%)
+reason_text             text        Mô tả ngắn. Ví dụ: "Bị lừa chuyển tiền mua hàng online", "Giả danh công an yêu cầu chuyển tiền".
+has_evidence            boolean     true(60%) | false(40%)
+confidence_score        numeric     0.5 – 1.0. Mức tin cậy của báo cáo.
+status                  enum        SUBMITTED(30%) | VERIFIED(40%) | REJECTED(15%) | RESOLVED(15%)
+created_at              timestamp   Trong 3 tháng gần nhất: 03/2026 – 05/2026.
+
+Rules:
+- 8-15 rows.
+- reporter_cif_no phải là ACTIVE customer.
+- reported_account_no KHÔNG cần thuộc bảng accounts (vì là tài khoản bên ngoài hệ thống).
+- Nếu transaction_ref != null, phải thuộc transactions.transaction_ref.
+- Ít nhất 3 reports cho cùng 1 reported_account_no để demo aggregate risk.
+- Ít nhất 2 reported_account_no thuộc cùng reported_customer_cif.
+
+==================================================
+TABLE 14: reported_accounts
+==================================================
+
+Purpose:
+Aggregate risk signal cho mỗi tài khoản bị báo cáo. Dùng cho transaction screening: khi user chuyển tiền, Guardian check receiver account có nằm trong reported_accounts không.
+
+Columns:
+
+reported_account_id     UUID        PK.
+account_no              string      Unique. Số tài khoản bị báo cáo.
+bank_code               string      Bank code. Từ BANK_MAP.
+linked_customer_cif     string|null CIF chủ tài khoản bị báo cáo, nếu biết.
+valid_report_count      integer     Số report status = VERIFIED hoặc SUBMITTED.
+unique_reporter_count   integer     Số người báo cáo khác nhau (distinct reporter_cif_no).
+total_reported_amount   numeric     Tổng số tiền bị báo cáo mất.
+avg_confidence_score    numeric     Trung bình confidence_score từ reports.
+risk_score              numeric     0.0 – 1.0. Tính từ các metrics trên.
+risk_level              enum        LOW | MEDIUM | HIGH | CRITICAL
+status                  enum        MONITORING(30%) | FLAGGED(40%) | BLOCKED(30%)
+first_reported_at       timestamp
+last_reported_at        timestamp   >= first_reported_at.
+
+Rules:
+- 8 rows.
+- Mỗi row là unique account_no.
+- valid_report_count >= 1.
+- risk_level mapping: LOW < 0.3, MEDIUM 0.3-0.6, HIGH 0.6-0.8, CRITICAL >= 0.8.
+- Ít nhất 2 accounts risk_level = HIGH hoặc CRITICAL.
+- account_no phải khớp với reported_account_no trong fraud_reports.
+- status = BLOCKED nếu risk_level = CRITICAL.
+
+==================================================
+TABLE 15: reported_customers
+==================================================
+
+Purpose:
+Aggregate risk cho CIF bị báo cáo (chủ sở hữu nhiều tài khoản bị report). Dùng khi 1 người sở hữu nhiều tài khoản bị báo cáo.
+
+Columns:
+
+reported_customer_id    UUID        PK.
+cif_no                  string      Unique. CIF bị báo cáo.
+reported_account_count  integer     Số tài khoản bị report thuộc CIF này.
+valid_report_count      integer     Tổng report liên quan.
+total_reported_amount   numeric     Tổng số tiền bị báo cáo mất.
+risk_score              numeric     0.0 – 1.0.
+risk_level              enum        LOW | MEDIUM | HIGH | CRITICAL
+status                  enum        MONITORING(30%) | FLAGGED(40%) | BLOCKED(30%)
+created_at              timestamp
+updated_at              timestamp   >= created_at.
+
+Rules:
+- 3-5 rows.
+- Mỗi row là CIF sở hữu ít nhất 1 reported_account.
+- reported_account_count >= 1.
+- cif_no KHÔNG cần thuộc bảng customers (vì là khách bên ngoài hệ thống).
+- linked_customer_cif trong reported_accounts phải match cif_no ở đây.
+
+==================================================
+TABLE 16: fraud_decisions
+==================================================
+
+Purpose:
+Lưu kết quả screening khi user chuyển tiền. Guardian lookup receiver account → nếu match reported_accounts → tạo fraud_decision: ALLOW / WARN / BLOCK.
+
+Columns:
+
+decision_id             UUID        PK.
+action_id               UUID        FK → action_requests.action_id. TRANSFER actions.
+receiver_account_no     string      Tài khoản nhận tiền.
+receiver_bank_code      string      Bank code.
+matched_report_count    integer     Số report match account nhận.
+risk_score              numeric     0.0 – 1.0.
+risk_level              enum        LOW | MEDIUM | HIGH | CRITICAL
+decision                enum        ALLOW(40%) | WARN(35%) | BLOCK(25%)
+reason_codes            JSON string json.dumps(). Ví dụ: ["REPORTED_ACCOUNT", "HIGH_RISK_SCORE", "MULTIPLE_REPORTERS"]
+created_at              timestamp
+
+Rules:
+- 15-20 rows.
+- action_id phải FK đúng, chỉ link tới action_type = TRANSFER.
+- Nếu decision = BLOCK → action.status nên là BLOCKED.
+- Nếu decision = ALLOW và matched_report_count = 0 → risk_score = 0.
+- Nếu decision = WARN → risk_level = MEDIUM hoặc HIGH.
+- Ít nhất 5 decisions có matched_report_count > 0 (có match reported_accounts).
+- Ít nhất 3 decisions = BLOCK.
+- receiver_account_no nên có ít nhất 3 rows match với reported_accounts.account_no.
+
+==================================================
 REQUIRED USE CASE PATTERNS
 ==================================================
 
@@ -677,6 +804,23 @@ Tạo ít nhất 30 transactions bất thường:
 - SALARY transactions direction=IN, ngày 1-5 tháng 5/2026.
 - description: "Luong thang 05/2026" hoặc "Luong T05/2026 - {company}".
 
+9. "Tôi muốn báo cáo lừa đảo"
+- Có fraud_reports từ nhiều customers.
+- Ít nhất 3 reports cho cùng 1 reported_account_no.
+- reported_accounts phải có aggregate data đúng.
+- fraud_type đa dạng: SCAM_TRANSFER, FAKE_INVESTMENT, IMPERSONATION.
+
+10. "Chuyển tiền cho tài khoản X" nhưng X bị reported
+- Ít nhất 3 fraud_decisions có matched_report_count > 0.
+- Ít nhất 3 fraud_decisions = BLOCK.
+- receiver_account_no match reported_accounts.account_no.
+- action_id link đúng tới TRANSFER actions.
+
+11. "Tài khoản này có an toàn không?" (transaction screening)
+- reported_accounts có đủ risk_level: LOW, MEDIUM, HIGH, CRITICAL.
+- Ít nhất 2 accounts risk_level HIGH/CRITICAL.
+- status = BLOCKED cho CRITICAL accounts.
+
 ==================================================
 VALIDATION FUNCTION
 ==================================================
@@ -701,6 +845,11 @@ FK integrity:
 - api_call_logs.action_id ∈ action_requests.action_id
 - audit_logs.action_id nếu != null ∈ action_requests.action_id
 - audit_logs.cif_no ∈ customers.cif_no
+- fraud_reports.reporter_cif_no ∈ customers.cif_no
+- fraud_reports.transaction_ref nếu != null ∈ transactions.transaction_ref
+- fraud_decisions.action_id ∈ action_requests.action_id (chỉ TRANSFER actions)
+- reported_accounts.account_no phải match ít nhất 1 fraud_reports.reported_account_no
+- reported_customers.cif_no phải match ít nhất 1 reported_accounts.linked_customer_cif
 
 Business rules:
 - Mỗi ACTIVE customer có ít nhất 1 ACTIVE PAYMENT account.
@@ -717,12 +866,18 @@ Business rules:
 - action.status == BLOCKED → không có api_call_logs SUCCESS.
 - api_call_logs.created_at > action_requests.created_at.
 - audit_logs cùng action_id có created_at tăng dần.
+- fraud_reports.status = VERIFIED hoặc SUBMITTED → phải được tính trong reported_accounts.valid_report_count.
+- fraud_decisions.decision = BLOCK → action.status nên là BLOCKED.
+- reported_accounts.risk_level = CRITICAL → status = BLOCKED.
+- reported_accounts.valid_report_count >= 1.
 
 Uniqueness:
 - transactions.transaction_ref unique.
 - accounts.account_no unique.
 - billers.biller_code unique.
 - transaction_categories.category_code unique.
+- reported_accounts.account_no unique.
+- reported_customers.cif_no unique.
 
 JSON validity:
 - Mọi JSON string field parse được bằng json.loads().
@@ -737,10 +892,10 @@ README.md GENERATION
 Script cũng phải generate `./mock_data/README.md` chứa:
 
 1. Mục đích dataset, 2-3 câu.
-2. Danh sách 12 bảng + row count.
+2. Danh sách 16 bảng + row count.
 3. Quan hệ chính dạng text ER diagram.
 4. Bảng nào dùng cho use case nào.
-5. 10 câu hỏi Text2SQL mẫu + optional SQL templates, không cần perfect production SQL:
+5. 12 câu hỏi Text2SQL mẫu + optional SQL templates, không cần perfect production SQL:
    - Tháng này tôi tiêu bao nhiêu cho ăn uống?
    - 3 giao dịch gần nhất của tôi là gì?
    - 3 giao dịch thẻ gần nhất của tôi là gì?
@@ -751,6 +906,8 @@ Script cũng phải generate `./mock_data/README.md` chứa:
    - Có giao dịch nào trên 10 triệu trong 7 ngày qua không?
    - Tôi chi bao nhiêu cho Grab trong tháng này?
    - Lương tháng này đã vào chưa?
+   - Tài khoản nhận này có bị báo cáo lừa đảo không?
+   - Có bao nhiêu báo cáo lừa đảo cho tài khoản X?
 6. 5 API payload examples:
    - TRANSFER
    - PHONE_TOPUP
@@ -772,7 +929,7 @@ Không bỏ sót README generation.
 Script khi chạy `python seed_mock_data.py` phải:
 1. Tạo folder ./mock_data/ nếu chưa có.
 2. Overwrite generated files safely nếu đã tồn tại.
-3. Generate 12 CSV files.
+3. Generate 16 CSV files.
 4. Generate README.md.
 5. Chạy validate_data().
 6. In summary: table name + row count + "ALL CHECKS PASSED" hoặc raise error.
