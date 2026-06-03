@@ -83,6 +83,22 @@ class AgentTaskResult(BaseModel):
     confidence: float = 1.0
 
 
+class PlanStep(BaseModel):
+    """A single resolution step in an agent plan."""
+    agent: str                        # registry key: "recipient_resolution", "text2sql"
+    task_type: str                    # "resolve_by_name", "query_evidence", etc.
+    input_from: str | None = None     # "extraction" | "step_0" | "step_1"
+    constraints: dict = Field(default_factory=dict)
+    reason: str                       # why this step is needed
+
+
+class AgentPlan(BaseModel):
+    """LLM-generated resolution plan for domain agent."""
+    steps: list[PlanStep] = Field(default_factory=list)
+    fallback: Literal["clarify", "proceed_partial"] = "clarify"
+    confidence: float = 0.0
+
+
 class DomainAgentOutput(BaseModel):
     """Standard output of any domain agent. Orchestrator doesn't care
     which agent produced it — same shape regardless."""

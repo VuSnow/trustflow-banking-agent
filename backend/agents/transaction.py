@@ -12,21 +12,45 @@ from backend.config import OPENAI_API_KEY, OPENAI_MODEL
 from backend.models import (
     TransactionExtraction,
     ActionDraft,
-    AgentTask,
+    AgentPlan,
+    AgentTaskResult,
     DomainAgentOutput,
 )
 from backend.prompts.transaction import TRANSACTION_SYSTEM_PROMPT, TRANSACTION_USER_TEMPLATE
+from backend.prompts.planning import (
+    PLANNING_SYSTEM_PROMPT,
+    PLANNING_USER_TEMPLATE,
+    AGENT_DESCRIPTIONS,
+)
+from backend.agents.registry import AgentRegistry
 from backend.agents.sub_agents.recipient_resolution import RecipientResolutionAgent
+from backend.agents.sub_agents.text2sql_client import Text2SQLSubAgent
+from backend.services.plan_validator import PlanValidator, PlanValidationError
+from backend.services.plan_executor import PlanExecutor
 
 logger = logging.getLogger(__name__)
 
+# Allowlisted agents for TransactionAgent planning
+TRANSACTION_ALLOWED_AGENTS = {"recipient_resolution", "text2sql"}
+
 
 class TransactionAgent:
-    """Domain agent for TRANSACTION intent."""
+    """Domain agent for TRANSACTION intent.
+
+    Uses LLM to generate a resolution plan, validates it, then executes
+    sub-agents to resolve missing fields before building ActionDraft.
+    """
 
     def __init__(self, client: AsyncOpenAI | None = None):
         self.client = client or AsyncOpenAI(api_key=OPENAI_API_KEY)
-        self.recipient_agent = RecipientResolutionAgent()
+
+        # Build registry
+        self.registry = AgentRegistry()
+        self.registry.register("recipient_resolution", RecipientResolutionAgent())
+        self.registry.register("text2sql", Text2SQLSubAgent())
+
+        self.plan_validator = PlanValidator()
+        self.plan_executor = PlanExecutor(self.registry)
 
     async def run(self, message: str, user_id: str, session_id: str) -> DomainAgentOutput:
         trace = []
@@ -44,41 +68,44 @@ class TransactionAgent:
                 delegation_trace=trace,
             )
 
-        # 3. Resolve recipient
-        if extraction.recipient_hint and not extraction.recipient_account:
-            result = await self.recipient_agent.execute_task(
-                AgentTask(
-                    task_type="resolve_by_name",
-                    constraints={
-                        "name": extraction.recipient_hint, "user_id": user_id},
-                )
-            )
-            trace.append("resolve_recipient")
+        # 3. Generate resolution plan (LLM)
+        plan = await self._generate_plan(extraction)
+        trace.append("generate_plan")
+        logger.info(f"[TX PLAN] {plan.model_dump_json()}")
 
-            if result.status == "success":
-                extraction.recipient_account = result.result["account_number"]
-                extraction.recipient_bank = result.result["bank_name"]
-                extraction.recipient_hint = result.result["recipient_name"]
-            elif result.status == "needs_clarification":
-                return DomainAgentOutput(
-                    status="clarification_needed",
-                    clarification_message=result.result["message"],
-                    delegation_trace=trace,
-                )
-        elif extraction.recipient_account and not extraction.recipient_bank:
-            result = await self.recipient_agent.execute_task(
-                AgentTask(
-                    task_type="resolve_by_account",
-                    constraints={
-                        "account_number": extraction.recipient_account, "user_id": user_id},
-                )
+        # 4. Validate plan (fixed safety)
+        try:
+            plan = self.plan_validator.validate(plan, TRANSACTION_ALLOWED_AGENTS)
+            trace.append("validate_plan")
+        except PlanValidationError as e:
+            logger.error(f"[TX PLAN] Validation failed: {e}")
+            # Fallback: return clarification
+            return DomainAgentOutput(
+                status="clarification_needed",
+                clarification_message="Không thể xử lý yêu cầu. Vui lòng thử lại.",
+                delegation_trace=trace,
             )
-            trace.append("resolve_by_account")
-            if result.status == "success":
-                extraction.recipient_bank = result.result["bank_name"]
-                extraction.recipient_hint = result.result["recipient_name"]
 
-        # 4. Validate required fields
+        # 5. Execute plan (dynamic)
+        if plan.steps:
+            results = await self.plan_executor.execute(
+                plan, {"user_id": user_id, "extraction": extraction.model_dump()}
+            )
+            trace.append("execute_plan")
+
+            # Check for clarification in any step result
+            for step_key, result in results.items():
+                if result.status == "needs_clarification":
+                    return DomainAgentOutput(
+                        status="clarification_needed",
+                        clarification_message=result.result.get("message", "Cần thêm thông tin."),
+                        delegation_trace=trace,
+                    )
+
+            # Merge resolved data back into extraction
+            extraction = self._merge_results(extraction, results)
+
+        # 6. Validate required fields after resolution
         if not extraction.amount:
             return DomainAgentOutput(
                 status="clarification_needed",
@@ -92,7 +119,7 @@ class TransactionAgent:
                 delegation_trace=trace,
             )
 
-        # 5. Build typed ActionDraft
+        # 7. Build typed ActionDraft
         draft = ActionDraft(
             action_type="TRANSACTION",
             operation=extraction.action,
@@ -136,3 +163,50 @@ class TransactionAgent:
                 clarification_reason="Không thể phân tích yêu cầu. Vui lòng thử lại.",
                 confidence=0.0,
             )
+
+    async def _generate_plan(self, extraction: TransactionExtraction) -> AgentPlan:
+        """Call LLM to generate a resolution plan based on extraction."""
+        try:
+            system_prompt = PLANNING_SYSTEM_PROMPT.replace(
+                "__AGENTS__", AGENT_DESCRIPTIONS
+            )
+            user_prompt = PLANNING_USER_TEMPLATE.replace(
+                "__EXTRACTION__", extraction.model_dump_json(indent=2)
+            )
+
+            response = await self.client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content
+            logger.info(f"[TX PLAN RAW] {raw}")
+            data = json.loads(raw)
+            return AgentPlan(**data)
+        except Exception as e:
+            logger.error(f"Planning error: {e}", exc_info=True)
+            # Fallback: empty plan (proceed with what we have)
+            return AgentPlan(steps=[], confidence=0.0)
+
+    def _merge_results(
+        self, extraction: TransactionExtraction, results: dict[str, AgentTaskResult]
+    ) -> TransactionExtraction:
+        """Merge successful resolution results back into extraction."""
+        for step_key, result in results.items():
+            if result.status != "success":
+                continue
+
+            data = result.result
+            # Merge recipient fields if resolved
+            if "account_number" in data:
+                extraction.recipient_account = data["account_number"]
+            if "bank_name" in data:
+                extraction.recipient_bank = data["bank_name"]
+            if "recipient_name" in data:
+                extraction.recipient_hint = data["recipient_name"]
+
+        return extraction
