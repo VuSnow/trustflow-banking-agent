@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.models import ChatRequest, ChatResponse
 from backend.agents.orchestrator import orchestrator
+from backend.agents.finance_advisor import FinanceAdvisorAgent
 from backend.agents.transaction import TransactionAgent
 import logging
 
@@ -23,8 +24,10 @@ app.add_middleware(
 
 # Domain agent registry
 transaction_agent = TransactionAgent()
+finance_advisor_agent = FinanceAdvisorAgent()
 DOMAIN_AGENT_MAP = {
     "TRANSACTION": transaction_agent,
+    "FINANCE_ADVICE": finance_advisor_agent,
 }
 
 
@@ -48,8 +51,8 @@ async def chat_endpoint(request: ChatRequest):
         output = await agent.run(request.message, request.user_id, request.session_id)
         return ChatResponse(
             status=output.status,
-            message=output.clarification_message or "Draft ready for review",
-            data=output.action_draft.model_dump() if output.action_draft else None,
+            message=output.clarification_message or output.info_response or "Draft ready for review",
+            data=output.response_data or (output.action_draft.model_dump() if output.action_draft else None),
         )
 
     # 3. Fallback: return classification only

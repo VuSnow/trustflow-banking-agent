@@ -1,3 +1,7 @@
+uvicorn backend.main:app --reload
+
+python -m backend.data.seed_banking_db
+
 # TrustFlow Guardian
 
 > Natural-language banking assistant with adversarial safety built in.

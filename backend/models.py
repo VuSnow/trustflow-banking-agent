@@ -27,7 +27,7 @@ class ChatResponse(BaseModel):
 class IntentResult(BaseModel):
     status: Literal["complete", "error"]
     task_type: Literal["QA", "DATA_QUERY", "TRANSACTION",
-                       "CARD_OPERATION", "ACCOUNT_OPERATION", "LOAN_OPERATION", "ERROR"]
+                       "CARD_OPERATION", "ACCOUNT_OPERATION", "LOAN_OPERATION", "FINANCE_ADVICE", "ERROR"]
     operation: Optional[str] = None
     confidence: float
     reason: str
@@ -106,4 +106,5 @@ class DomainAgentOutput(BaseModel):
     action_draft: ActionDraft | None = None
     clarification_message: str | None = None
     info_response: str | None = None
+    response_data: dict | None = None
     delegation_trace: list[str] = Field(default_factory=list)

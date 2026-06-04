@@ -15,6 +15,7 @@ Important boundaries:
 Task types:
 - QA: user asks about banking information, policies, fees, interest rates, products, required documents, or general guidance.
 - DATA_QUERY: user asks to view, check, search, summarize, compare, or analyze their own banking data.
+- FINANCE_ADVICE: user wants spending guidance, budgeting help, savings ideas, recurring-charge review, or personal finance coaching based on their own transaction history.
 - TRANSACTION: user wants to perform money movement or payment.
 - CARD_OPERATION: user wants to manage a bank card.
 - ACCOUNT_OPERATION: user wants to open, close, update, or manage a bank account or beneficiary.
@@ -63,16 +64,17 @@ Routing rules:
 - If the user wants to open, close, update, or manage an account/beneficiary → ACCOUNT_OPERATION.
 - If the user wants to apply for, repay, or manage a loan → LOAN_OPERATION.
 - If the user wants to report fraud, scam, or a suspicious transaction → FRAUD_REPORT.
+- If the user wants help understanding spending habits, budgeting, subscriptions, savings opportunities, or personal finance advice based on transaction history → FINANCE_ADVICE.
 - If the user asks to check, view, search, summarize, compare, or analyze their own banking data → DATA_QUERY.
 - If the user asks about rules, policies, fees, interest rates, product information, required documents, or how something works → QA.
 
 Priority rule:
 If multiple intents appear, choose the highest-impact task type:
-FRAUD_REPORT > TRANSACTION > CARD_OPERATION > ACCOUNT_OPERATION > LOAN_OPERATION > DATA_QUERY > QA.
+FRAUD_REPORT > TRANSACTION > CARD_OPERATION > ACCOUNT_OPERATION > LOAN_OPERATION > FINANCE_ADVICE > DATA_QUERY > QA.
 
 Output schema:
 {
-  "task_type": "QA | DATA_QUERY | TRANSACTION | CARD_OPERATION | ACCOUNT_OPERATION | LOAN_OPERATION | FRAUD_REPORT",
+  "task_type": "QA | DATA_QUERY | TRANSACTION | CARD_OPERATION | ACCOUNT_OPERATION | LOAN_OPERATION | FINANCE_ADVICE | FRAUD_REPORT",
   "operation": "TRANSFER_MONEY | BILL_PAYMENT | TOP_UP | LOCK_CARD | UNLOCK_CARD | ACTIVATE_CARD | REISSUE_CARD | CHANGE_CARD_LIMIT | VIEW_CARD_INFO | OPEN_ACCOUNT | CLOSE_ACCOUNT | UPDATE_ACCOUNT_INFO | MANAGE_BENEFICIARY | VIEW_ACCOUNT_INFO | APPLY_LOAN | CHECK_LOAN_STATUS | REPAY_LOAN | VIEW_LOAN_INFO | REPORT_FRAUD | CHECK_FRAUD_STATUS | null",
   "confidence": 0.0,
   "reason": "short reason in English"
@@ -96,6 +98,15 @@ Output:
   "operation": null,
   "confidence": 0.97,
   "reason": "User is asking to analyze personal spending data."
+}
+
+User: "Giúp tôi phân tích chi tiêu và tìm cách tiết kiệm tiền"
+Output:
+{
+  "task_type": "FINANCE_ADVICE",
+  "operation": null,
+  "confidence": 0.97,
+  "reason": "User wants personal finance guidance and savings advice."
 }
 
 User: "Chuyển 2 triệu cho Minh"
