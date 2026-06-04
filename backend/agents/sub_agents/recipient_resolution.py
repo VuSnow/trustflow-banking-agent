@@ -6,21 +6,19 @@ Data sources:
 2. transactions table — historical recipients (fallback)
 """
 import json
-import sqlite3
-import os
 import logging
 
+import psycopg2
+import psycopg2.extras
+
+from backend.config import DATABASE_URL
 from backend.models import AgentTask, AgentTaskResult
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..",
-                       "..", "data", "banking.db")
 
-
-def _get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+def _get_connection():
+    conn = psycopg2.connect(DATABASE_URL)
     return conn
 
 
@@ -50,43 +48,48 @@ class RecipientResolutionAgent:
 
         conn = _get_connection()
         try:
-            # Step 1: beneficiaries
-            rows = conn.execute(
-                """SELECT name, nicknames, account_number, bank_name
-                   FROM beneficiaries
-                   WHERE user_id = ? AND (name LIKE ? OR nicknames LIKE ?)""",
-                (user_id, pattern, pattern),
-            ).fetchall()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Step 1: beneficiaries
+                cur.execute(
+                    """SELECT beneficiary_name, nickname, beneficiary_account_no, beneficiary_bank_code, beneficiary_bank_name
+                       FROM beneficiaries
+                       WHERE cif_no = %s AND (beneficiary_name ILIKE %s OR nickname ILIKE %s)""",
+                    (user_id, pattern, pattern),
+                )
+                rows = cur.fetchall()
 
             candidates = []
             for row in rows:
                 candidates.append({
-                    "name": row["name"],
-                    "nicknames": json.loads(row["nicknames"]) if row["nicknames"] else [],
-                    "account_number": row["account_number"],
-                    "bank_name": row["bank_name"],
+                    "name": row["beneficiary_name"],
+                    "nicknames": [row["nickname"]] if row["nickname"] else [],
+                    "account_number": row["beneficiary_account_no"],
+                    "bank_name": row["beneficiary_bank_name"] or row["beneficiary_bank_code"],
                     "source": "saved_beneficiary",
                 })
 
             # Step 2: fallback to transaction history if no beneficiary match
             if not candidates:
-                tx_rows = conn.execute(
-                    """SELECT DISTINCT recipient_name, recipient_account, recipient_bank
-                       FROM transactions
-                       WHERE user_id = ? AND recipient_name LIKE ?
-                       ORDER BY created_at DESC""",
-                    (user_id, pattern),
-                ).fetchall()
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        """SELECT DISTINCT counterparty_name, counterparty_account_no, counterparty_bank_code
+                           FROM transactions
+                           WHERE cif_no = %s AND counterparty_name ILIKE %s AND direction = 'OUT'
+                           ORDER BY counterparty_name""",
+                        (user_id, pattern),
+                    )
+                    tx_rows = cur.fetchall()
 
                 seen_accounts = set()
                 for row in tx_rows:
-                    if row["recipient_account"] not in seen_accounts:
-                        seen_accounts.add(row["recipient_account"])
+                    acct = row["counterparty_account_no"]
+                    if acct and acct not in seen_accounts:
+                        seen_accounts.add(acct)
                         candidates.append({
-                            "name": row["recipient_name"],
+                            "name": row["counterparty_name"],
                             "nicknames": [],
-                            "account_number": row["recipient_account"],
-                            "bank_name": row["recipient_bank"],
+                            "account_number": acct,
+                            "bank_name": row["counterparty_bank_code"],
                             "source": "transaction_history",
                         })
         finally:
@@ -134,41 +137,45 @@ class RecipientResolutionAgent:
 
         conn = _get_connection()
         try:
-            row = conn.execute(
-                """SELECT name, account_number, bank_name
-                   FROM beneficiaries
-                   WHERE user_id = ? AND account_number = ?""",
-                (user_id, account),
-            ).fetchone()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT beneficiary_name, beneficiary_account_no, beneficiary_bank_code, beneficiary_bank_name
+                       FROM beneficiaries
+                       WHERE cif_no = %s AND beneficiary_account_no = %s""",
+                    (user_id, account),
+                )
+                row = cur.fetchone()
 
             if row:
                 return AgentTaskResult(
                     status="success",
                     result={
-                        "recipient_name": row["name"],
-                        "account_number": row["account_number"],
-                        "bank_name": row["bank_name"],
+                        "recipient_name": row["beneficiary_name"],
+                        "account_number": row["beneficiary_account_no"],
+                        "bank_name": row["beneficiary_bank_name"] or row["beneficiary_bank_code"],
                         "source": "saved_beneficiary",
                     },
                     confidence=0.98,
                 )
 
             # Fallback: transaction history
-            tx_row = conn.execute(
-                """SELECT DISTINCT recipient_name, recipient_account, recipient_bank
-                   FROM transactions
-                   WHERE user_id = ? AND recipient_account = ?
-                   ORDER BY created_at DESC LIMIT 1""",
-                (user_id, account),
-            ).fetchone()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT DISTINCT counterparty_name, counterparty_account_no, counterparty_bank_code
+                       FROM transactions
+                       WHERE cif_no = %s AND counterparty_account_no = %s AND direction = 'OUT'
+                       LIMIT 1""",
+                    (user_id, account),
+                )
+                tx_row = cur.fetchone()
 
             if tx_row:
                 return AgentTaskResult(
                     status="success",
                     result={
-                        "recipient_name": tx_row["recipient_name"],
-                        "account_number": tx_row["recipient_account"],
-                        "bank_name": tx_row["recipient_bank"],
+                        "recipient_name": tx_row["counterparty_name"],
+                        "account_number": tx_row["counterparty_account_no"],
+                        "bank_name": tx_row["counterparty_bank_code"],
                         "source": "transaction_history",
                     },
                     confidence=0.85,
@@ -237,37 +244,41 @@ class RecipientResolutionAgent:
         try:
             for c in candidates:
                 # Check beneficiaries first
-                row = conn.execute(
-                    """SELECT name, account_number, bank_name
-                       FROM beneficiaries
-                       WHERE user_id = ? AND account_number = ?""",
-                    (user_id, c["account_number"]),
-                ).fetchone()
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        """SELECT beneficiary_name, beneficiary_account_no, beneficiary_bank_code, beneficiary_bank_name
+                           FROM beneficiaries
+                           WHERE cif_no = %s AND beneficiary_account_no = %s""",
+                        (user_id, c["account_number"]),
+                    )
+                    row = cur.fetchone()
 
                 if row:
                     verified.append({
-                        "recipient_name": row["name"],
-                        "account_number": row["account_number"],
-                        "bank_name": row["bank_name"],
+                        "recipient_name": row["beneficiary_name"],
+                        "account_number": row["beneficiary_account_no"],
+                        "bank_name": row["beneficiary_bank_name"] or row["beneficiary_bank_code"],
                         "source": "saved_beneficiary",
                         "confidence": 0.95,
                     })
                     continue
 
                 # Fallback: transaction history
-                tx_row = conn.execute(
-                    """SELECT DISTINCT recipient_name, recipient_account, recipient_bank
-                       FROM transactions
-                       WHERE user_id = ? AND recipient_account = ?
-                       ORDER BY created_at DESC LIMIT 1""",
-                    (user_id, c["account_number"]),
-                ).fetchone()
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        """SELECT DISTINCT counterparty_name, counterparty_account_no, counterparty_bank_code
+                           FROM transactions
+                           WHERE cif_no = %s AND counterparty_account_no = %s AND direction = 'OUT'
+                           LIMIT 1""",
+                        (user_id, c["account_number"]),
+                    )
+                    tx_row = cur.fetchone()
 
                 if tx_row:
                     verified.append({
-                        "recipient_name": tx_row["recipient_name"],
-                        "account_number": tx_row["recipient_account"],
-                        "bank_name": tx_row["recipient_bank"],
+                        "recipient_name": tx_row["counterparty_name"],
+                        "account_number": tx_row["counterparty_account_no"],
+                        "bank_name": tx_row["counterparty_bank_code"],
                         "source": "transaction_history",
                         "confidence": 0.80,
                     })

@@ -24,10 +24,46 @@ class ChatResponse(BaseModel):
     auth_required: str | None = None
 
 
+class ChatSessionCreateRequest(BaseModel):
+    user_id: str
+    title: str | None = None
+
+
+class ChatSessionUpdateRequest(BaseModel):
+    title: str | None = None
+    status: str | None = None
+
+
+class ChatMessageRecord(BaseModel):
+    id: int | None = None
+    session_id: str
+    user_id: str
+    role: Literal["user", "assistant", "system"]
+    message: str
+    data: dict | None = None
+    created_at: str
+
+
+class ChatSessionRecord(BaseModel):
+    session_id: str
+    user_id: str
+    title: str | None = None
+    status: str = "active"
+    created_at: str
+    updated_at: str
+    message_count: int = 0
+    last_message_at: str | None = None
+
+
+class ChatSessionDetail(ChatSessionRecord):
+    messages: list[ChatMessageRecord] = Field(default_factory=list)
+
+
 class IntentResult(BaseModel):
     status: Literal["complete", "error"]
     task_type: Literal["QA", "DATA_QUERY", "TRANSACTION",
-                       "CARD_OPERATION", "ACCOUNT_OPERATION", "LOAN_OPERATION", "ERROR"]
+                       "CARD_OPERATION", "ACCOUNT_OPERATION", "LOAN_OPERATION",
+                       "FINANCE_ADVICE", "FRAUD_REPORT", "ERROR"]
     operation: Optional[str] = None
     confidence: float
     reason: str
@@ -69,6 +105,46 @@ class ActionDraft(BaseModel):
     note: str | None = None
 
 
+class FraudReportExtraction(BaseModel):
+    """Typed extraction for fraud-report intake."""
+    operation: Literal["REPORT_FRAUD", "CHECK_FRAUD_STATUS"] = "REPORT_FRAUD"
+    fraud_type: str | None = None
+    reported_account_no: str | None = None
+    reported_bank_code: str | None = None
+    transaction_ref: str | None = None
+    contact_channel: str | None = None
+    aftermath: str | None = None
+    reason_text: str | None = None
+    has_evidence: bool | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
+
+
+class FraudReportDetails(BaseModel):
+    """Draft payload for a fraud report. This is not persisted in this phase."""
+    reporter_cif_no: str
+    transaction_ref: str | None = None
+    reported_account_no: str
+    reported_bank_code: str
+    reported_customer_cif: str | None = None
+    fraud_type: str
+    contact_channel: str
+    aftermath: str
+    reason_text: str
+    has_evidence: bool
+    confidence_score: int
+    status: Literal["VALIDATED", "SUBMITTED"]
+
+
+class FraudReportDraft(BaseModel):
+    """Top-level draft returned by FraudReportAgent."""
+    action_type: Literal["FRAUD_REPORT"] = "FRAUD_REPORT"
+    cif_no: str
+    api_name: Literal["fraud_report_service"] = "fraud_report_service"
+    report_draft: FraudReportDetails
+    verification_evidence: dict = Field(default_factory=dict)
+
+
 class AgentTask(BaseModel):
     """Generic task request from domain agent to sub-agent."""
     task_type: str                                    # e.g. "resolve_by_name", "resolve_by_account"
@@ -106,4 +182,5 @@ class DomainAgentOutput(BaseModel):
     action_draft: ActionDraft | None = None
     clarification_message: str | None = None
     info_response: str | None = None
+    response_data: dict | None = None
     delegation_trace: list[str] = Field(default_factory=list)

@@ -56,6 +56,7 @@ docker-compose up
 
 - Backend: http://localhost:8000
 - Frontend: http://localhost:8501
+- `/web_ui` serves the static HTML frontend
 
 ## API
 
@@ -92,7 +93,7 @@ GET  /health                       → Health check
 | LLM | GPT-4o-mini |
 | SQL Parsing | sqlglot |
 | DB | SQLite (hackathon) |
-| Frontend | Streamlit |
+| Frontend | Static HTML + Preact |
 | Deployment | Docker Compose |
 
 ## Project Structure
