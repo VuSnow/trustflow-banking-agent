@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 
+import psycopg2
+import psycopg2.extras
 
-DB_PATH = Path(__file__).resolve().parents[2] / "data" / "banking.db"
+from backend.config import DATABASE_URL
 
 
 @dataclass
@@ -24,25 +24,26 @@ class FraudReportSessionState:
 
 
 class FraudReportSessionStore:
-    """SQLite-backed multi-turn state for fraud-report intake."""
+    """PostgreSQL-backed multi-turn state for fraud-report intake."""
 
-    def __init__(self, db_path: Path | None = None):
-        self.db_path = db_path or DB_PATH
-        self._ensure_schema()
+    def __init__(self, dsn: str | None = None):
+        self.dsn = dsn or DATABASE_URL
 
     def get(self, user_id: str, session_id: str) -> FraudReportSessionState | None:
         conn = self._connect()
         try:
-            row = conn.execute(
-                """
-                SELECT user_id, session_id, fields_json, stage, candidate_transactions_json,
-                       selected_transaction_ref, last_prompt, created_at, updated_at
-                FROM fraud_report_sessions
-                WHERE user_id = ? AND session_id = ?
-                LIMIT 1
-                """,
-                (user_id, session_id),
-            ).fetchone()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT user_id, session_id, fields_json, stage, candidate_transactions_json,
+                           selected_transaction_ref, last_prompt, created_at, updated_at
+                    FROM fraud_report_sessions
+                    WHERE user_id = %s AND session_id = %s
+                    LIMIT 1
+                    """,
+                    (user_id, session_id),
+                )
+                row = cur.fetchone()
             if not row:
                 return None
             return self._row_to_state(row)
@@ -113,10 +114,11 @@ class FraudReportSessionStore:
     def clear(self, user_id: str, session_id: str) -> None:
         conn = self._connect()
         try:
-            conn.execute(
-                "DELETE FROM fraud_report_sessions WHERE user_id = ? AND session_id = ?",
-                (user_id, session_id),
-            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM fraud_report_sessions WHERE user_id = %s AND session_id = %s",
+                    (user_id, session_id),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -124,37 +126,38 @@ class FraudReportSessionStore:
     def _upsert(self, state: FraudReportSessionState) -> None:
         conn = self._connect()
         try:
-            conn.execute(
-                """
-                INSERT INTO fraud_report_sessions (
-                    user_id, session_id, fields_json, stage, candidate_transactions_json,
-                    selected_transaction_ref, last_prompt, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, session_id) DO UPDATE SET
-                    fields_json=excluded.fields_json,
-                    stage=excluded.stage,
-                    candidate_transactions_json=excluded.candidate_transactions_json,
-                    selected_transaction_ref=excluded.selected_transaction_ref,
-                    last_prompt=excluded.last_prompt,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    state.user_id,
-                    state.session_id,
-                    json.dumps(state.fields, ensure_ascii=False),
-                    state.stage,
-                    json.dumps(state.candidate_transactions, ensure_ascii=False),
-                    state.selected_transaction_ref,
-                    state.last_prompt,
-                    state.created_at,
-                    state.updated_at,
-                ),
-            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO fraud_report_sessions (
+                        user_id, session_id, fields_json, stage, candidate_transactions_json,
+                        selected_transaction_ref, last_prompt, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, session_id) DO UPDATE SET
+                        fields_json = EXCLUDED.fields_json,
+                        stage = EXCLUDED.stage,
+                        candidate_transactions_json = EXCLUDED.candidate_transactions_json,
+                        selected_transaction_ref = EXCLUDED.selected_transaction_ref,
+                        last_prompt = EXCLUDED.last_prompt,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        state.user_id,
+                        state.session_id,
+                        json.dumps(state.fields, ensure_ascii=False),
+                        state.stage,
+                        json.dumps(state.candidate_transactions, ensure_ascii=False, default=str),
+                        state.selected_transaction_ref,
+                        state.last_prompt,
+                        state.created_at,
+                        state.updated_at,
+                    ),
+                )
             conn.commit()
         finally:
             conn.close()
 
-    def _row_to_state(self, row: sqlite3.Row) -> FraudReportSessionState:
+    def _row_to_state(self, row: dict) -> FraudReportSessionState:
         return FraudReportSessionState(
             user_id=row["user_id"],
             session_id=row["session_id"],
@@ -163,38 +166,12 @@ class FraudReportSessionStore:
             candidate_transactions=json.loads(row["candidate_transactions_json"] or "[]"),
             selected_transaction_ref=row["selected_transaction_ref"],
             last_prompt=row["last_prompt"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
         )
 
-    def _ensure_schema(self) -> None:
-        conn = self._connect()
-        try:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS fraud_report_sessions (
-                    user_id TEXT NOT NULL REFERENCES users(user_id),
-                    session_id TEXT NOT NULL,
-                    fields_json TEXT NOT NULL DEFAULT '{}',
-                    stage TEXT NOT NULL DEFAULT 'collect_account',
-                    candidate_transactions_json TEXT NOT NULL DEFAULT '[]',
-                    selected_transaction_ref TEXT,
-                    last_prompt TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (user_id, session_id)
-                );
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+    def _connect(self):
+        return psycopg2.connect(self.dsn)
 
     def _now(self) -> str:
         return datetime.now().isoformat(timespec="seconds")

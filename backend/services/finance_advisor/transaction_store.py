@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-import os
 import re
-import sqlite3
-from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[2] / "data" / "banking.db"
+import psycopg2
+import psycopg2.extras
+
+from backend.config import DATABASE_URL
 
 
 def parse_lookback_days(message: str | None, default_days: int = 30) -> int:
@@ -34,31 +34,49 @@ def parse_lookback_days(message: str | None, default_days: int = 30) -> int:
 
 
 class FinanceTransactionStore:
-    """Reads user transactions from the existing SQLite database."""
-
-    def __init__(self, db_path: Path | None = None):
-        self.db_path = db_path or DB_PATH
+    """Reads user transactions from the PostgreSQL database."""
 
     def load_user_transactions(self, user_id: str, lookback_days: int = 30) -> list[dict]:
         cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
 
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        conn = psycopg2.connect(DATABASE_URL)
         try:
-            rows = conn.execute(
-                """
-                SELECT id, user_id, source_account, recipient_name, recipient_account,
-                       recipient_bank, amount, currency, category, transaction_type,
-                       note, status, created_at
-                FROM transactions
-                WHERE user_id = ? AND created_at >= ?
-                ORDER BY created_at DESC
-                """,
-                (user_id, cutoff),
-            ).fetchall()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT t.transaction_ref, t.cif_no, t.account_no, t.counterparty_name,
+                           t.counterparty_account_no, t.counterparty_bank_code,
+                           t.amount, t.currency, tc.category_name, t.direction,
+                           t.description, t.status, t.transaction_time
+                    FROM transactions t
+                    LEFT JOIN transaction_categories tc ON t.category_id = tc.category_id
+                    WHERE t.cif_no = %s AND t.transaction_time >= %s
+                    ORDER BY t.transaction_time DESC
+                    """,
+                    (user_id, cutoff),
+                )
+                rows = cur.fetchall()
 
-            return [dict(row) for row in rows]
+            # Map PG columns to the interface expected downstream
+            results = []
+            for row in rows:
+                results.append({
+                    "id": row["transaction_ref"],
+                    "user_id": row["cif_no"],
+                    "source_account": row["account_no"],
+                    "recipient_name": row["counterparty_name"],
+                    "recipient_account": row["counterparty_account_no"],
+                    "recipient_bank": row["counterparty_bank_code"],
+                    "amount": row["amount"],
+                    "currency": row["currency"],
+                    "category": row["category_name"],
+                    "transaction_type": row["direction"],
+                    "note": row["description"],
+                    "status": row["status"],
+                    "created_at": str(row["transaction_time"]) if row["transaction_time"] else None,
+                })
+            return results
         finally:
             conn.close()

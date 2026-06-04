@@ -1,31 +1,34 @@
 from __future__ import annotations
 
 import re
-import sqlite3
-from pathlib import Path
+import uuid
+from datetime import datetime
 
-DB_PATH = Path(__file__).resolve().parents[2] / "data" / "banking.db"
+import psycopg2
+import psycopg2.extras
+
+from backend.config import DATABASE_URL
 
 
 class FraudReportStore:
-    """Read-only fraud report data access against the current SQLite schema."""
+    """Fraud report data access against PostgreSQL."""
 
-    def __init__(self, db_path: Path | None = None):
-        self.db_path = db_path or DB_PATH
+    def __init__(self, dsn: str | None = None):
+        self.dsn = dsn or DATABASE_URL
 
     def is_self_account(self, user_id: str, account_number: str) -> bool:
         conn = self._connect()
         try:
-            row = conn.execute(
-                """
-                SELECT 1
-                FROM accounts
-                WHERE user_id = ? AND account_number = ?
-                LIMIT 1
-                """,
-                (user_id, account_number),
-            ).fetchone()
-            return row is not None
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM accounts
+                    WHERE cif_no = %s AND account_no = %s
+                    LIMIT 1
+                    """,
+                    (user_id, account_number),
+                )
+                return cur.fetchone() is not None
         finally:
             conn.close()
 
@@ -37,33 +40,36 @@ class FraudReportStore:
         reported_bank_code: str | None = None,
         transaction_ref: str | None = None,
     ) -> list[dict]:
-        tx_id = self._parse_transaction_ref(transaction_ref)
         params: list[object] = [user_id, reported_account_no]
         filters = [
-            "user_id = ?",
-            "recipient_account = ?",
-            "LOWER(status) IN ('completed', 'success', 'successful')",
+            "cif_no = %s",
+            "counterparty_account_no = %s",
+            "direction = 'OUT'",
+            "status = 'SUCCESS'",
         ]
 
-        if tx_id is not None:
-            filters.append("id = ?")
-            params.append(tx_id)
+        if transaction_ref:
+            filters.append("transaction_ref = %s")
+            params.append(transaction_ref)
 
         conn = self._connect()
         try:
-            rows = conn.execute(
-                f"""
-                SELECT id, user_id, source_account, recipient_name, recipient_account,
-                       recipient_bank, amount, currency, category, transaction_type,
-                       note, status, created_at
-                FROM transactions
-                WHERE {" AND ".join(filters)}
-                ORDER BY created_at DESC
-                LIMIT 10
-                """,
-                params,
-            ).fetchall()
-            transactions = [self._transaction_to_dict(row) for row in rows]
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    f"""
+                    SELECT transaction_ref, cif_no, account_no, counterparty_name,
+                           counterparty_account_no, counterparty_bank_code,
+                           amount, currency, transaction_type, description,
+                           status, transaction_time, created_at
+                    FROM transactions
+                    WHERE {" AND ".join(filters)}
+                    ORDER BY transaction_time DESC
+                    LIMIT 10
+                    """,
+                    params,
+                )
+                rows = cur.fetchall()
+            transactions = [self._transaction_to_dict(dict(row)) for row in rows]
             if reported_bank_code:
                 transactions.sort(
                     key=lambda tx: self._bank_matches(
@@ -79,16 +85,144 @@ class FraudReportStore:
     def get_reported_account(self, account_number: str) -> dict | None:
         conn = self._connect()
         try:
-            row = conn.execute(
-                """
-                SELECT account_number, bank_name, reason, reported_at, severity
-                FROM reported_accounts
-                WHERE account_number = ?
-                LIMIT 1
-                """,
-                (account_number,),
-            ).fetchone()
-            return dict(row) if row else None
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT account_no, bank_code, risk_score, risk_level,
+                           valid_report_count, unique_reporter_count,
+                           total_reported_amount, avg_confidence_score,
+                           status, first_reported_at, last_reported_at
+                    FROM reported_accounts
+                    WHERE account_no = %s
+                    LIMIT 1
+                    """,
+                    (account_number,),
+                )
+                row = cur.fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result["severity"] = result.get("risk_level", "LOW")
+            return result
+        finally:
+            conn.close()
+
+    def find_user_existing_reports(
+        self,
+        user_id: str,
+        reported_account_no: str,
+    ) -> list[dict]:
+        """Check if this user already filed a report against this account."""
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT report_id, reporter_cif_no, transaction_ref, reported_account_no,
+                           reported_bank_code, fraud_type, confidence_score, status, created_at
+                    FROM fraud_reports
+                    WHERE reporter_cif_no = %s AND reported_account_no = %s
+                    ORDER BY created_at DESC
+                    """,
+                    (user_id, reported_account_no),
+                )
+                return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def persist_report(
+        self,
+        *,
+        reporter_cif_no: str,
+        transaction_ref: str | None,
+        reported_account_no: str,
+        reported_bank_code: str,
+        reported_customer_cif: str | None = None,
+        fraud_type: str,
+        contact_channel: str,
+        aftermath: str,
+        reason_text: str,
+        has_evidence: bool,
+        confidence_score: int,
+        status: str,
+    ) -> str:
+        """Insert a fraud report and return the report_id."""
+        report_id = str(uuid.uuid4())
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO fraud_reports (
+                        report_id, reporter_cif_no, transaction_ref, reported_account_no,
+                        reported_bank_code, reported_customer_cif, fraud_type, contact_channel,
+                        aftermath, reason_text, has_evidence, confidence_score, status, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        report_id, reporter_cif_no, transaction_ref, reported_account_no,
+                        reported_bank_code, reported_customer_cif, fraud_type, contact_channel,
+                        aftermath, reason_text, has_evidence, confidence_score, status,
+                        datetime.now(),
+                    ),
+                )
+            conn.commit()
+            return report_id
+        finally:
+            conn.close()
+
+    def update_reported_account_aggregate(
+        self,
+        account_no: str,
+        bank_code: str,
+        confidence_score: int,
+        reporter_cif_no: str,
+        amount: int | None = None,
+    ) -> None:
+        """Update or insert reported_accounts aggregate after persisting a report."""
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM reported_accounts WHERE account_no = %s AND bank_code = %s",
+                    (account_no, bank_code),
+                )
+                existing = cur.fetchone()
+
+                now = datetime.now()
+                if existing:
+                    new_count = (existing["valid_report_count"] or 0) + 1
+                    new_unique = (existing["unique_reporter_count"] or 0) + 1
+                    new_total = (existing["total_reported_amount"] or 0) + (amount or 0)
+                    new_avg = ((existing["avg_confidence_score"] or 0) * (new_count - 1) + confidence_score) // new_count
+                    new_risk = min(0.95, (existing["risk_score"] or 0) + 0.15)
+                    new_level = self._risk_score_to_level(float(new_risk))
+                    cur.execute(
+                        """
+                        UPDATE reported_accounts
+                        SET valid_report_count = %s, unique_reporter_count = %s,
+                            total_reported_amount = %s, avg_confidence_score = %s,
+                            risk_score = %s, risk_level = %s, last_reported_at = %s
+                        WHERE account_no = %s AND bank_code = %s
+                        """,
+                        (new_count, new_unique, new_total, new_avg,
+                         new_risk, new_level, now, account_no, bank_code),
+                    )
+                else:
+                    risk_score = 0.25 if confidence_score < 80 else 0.95
+                    risk_level = self._risk_score_to_level(risk_score)
+                    cur.execute(
+                        """
+                        INSERT INTO reported_accounts (
+                            reported_account_id, account_no, bank_code, valid_report_count,
+                            unique_reporter_count, total_reported_amount, avg_confidence_score,
+                            risk_score, risk_level, status, first_reported_at, last_reported_at
+                        ) VALUES (%s, %s, %s, 1, 1, %s, %s, %s, %s, 'ACTIVE', %s, %s)
+                        """,
+                        (str(uuid.uuid4()), account_no, bank_code, amount or 0,
+                         confidence_score, risk_score, risk_level, now, now),
+                    )
+            conn.commit()
         finally:
             conn.close()
 
@@ -102,26 +236,31 @@ class FraudReportStore:
             f"{amount_text} {tx.get('currency', 'VND')} | {tx.get('created_at')}"
         )
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _transaction_to_dict(self, row: sqlite3.Row) -> dict:
-        data = dict(row)
-        data["transaction_ref"] = self.format_transaction_ref(data["id"])
-        return data
+    def _connect(self):
+        return psycopg2.connect(self.dsn)
 
     @staticmethod
-    def format_transaction_ref(transaction_id: int | str) -> str:
-        return f"TX-{transaction_id}"
+    def _transaction_to_dict(row: dict) -> dict:
+        row["transaction_ref"] = row.get("transaction_ref", "")
+        row["recipient_name"] = row.pop("counterparty_name", None) or ""
+        row["recipient_account"] = row.pop("counterparty_account_no", None) or ""
+        row["recipient_bank"] = row.pop("counterparty_bank_code", None) or ""
+        row["created_at"] = str(row.get("transaction_time") or row.get("created_at") or "")
+        return row
 
     @staticmethod
-    def _parse_transaction_ref(transaction_ref: str | None) -> int | None:
-        if not transaction_ref:
-            return None
-        match = re.search(r"(\d+)", transaction_ref)
-        return int(match.group(1)) if match else None
+    def format_transaction_ref(transaction_ref: str) -> str:
+        return transaction_ref
+
+    @staticmethod
+    def _risk_score_to_level(score: float) -> str:
+        if score >= 0.8:
+            return "CRITICAL"
+        elif score >= 0.6:
+            return "HIGH"
+        elif score >= 0.3:
+            return "MEDIUM"
+        return "LOW"
 
     @staticmethod
     def _bank_matches(stored_bank: str, reported_bank_code: str) -> bool:

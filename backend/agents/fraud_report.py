@@ -113,6 +113,39 @@ class FraudReportAgent:
         if selection_result is not None:
             return selection_result
 
+        # Duplicate detection: check if user already reported this account
+        reported_account_no = state.fields.get("reported_account_no")
+        if reported_account_no:
+            existing_reports = self.store.find_user_existing_reports(user_id, reported_account_no)
+            if existing_reports:
+                tx_ref = state.fields.get("transaction_ref")
+                exact_dup = any(
+                    r.get("transaction_ref") == tx_ref
+                    for r in existing_reports
+                    if tx_ref
+                )
+                if exact_dup:
+                    self.session_store.clear(user_id, session_id)
+                    trace.append("duplicate_report_rejected")
+                    return DomainAgentOutput(
+                        status="info_response",
+                        info_response=(
+                            "Bạn đã báo cáo tài khoản này với cùng giao dịch trước đó. "
+                            "Nếu có thông tin mới, vui lòng liên hệ hotline ngân hàng."
+                        ),
+                        response_data={
+                            "operation": "REPORT_FRAUD",
+                            "rejected": True,
+                            "reason": "duplicate_report",
+                            "existing_reports": [
+                                {"report_id": str(r.get("report_id")), "status": r.get("status")}
+                                for r in existing_reports
+                            ],
+                            "trace": trace,
+                        },
+                        delegation_trace=trace,
+                    )
+
         missing_fields = self._missing_required_fields(state.fields)
 
         if missing_fields:
@@ -184,6 +217,39 @@ class FraudReportAgent:
             scoring=scoring,
         )
         trace.append("build_fraud_report_draft")
+
+        # Persist report to database
+        try:
+            report_id = self.store.persist_report(
+                reporter_cif_no=user_id,
+                transaction_ref=state.fields.get("transaction_ref"),
+                reported_account_no=state.fields["reported_account_no"],
+                reported_bank_code=state.fields["reported_bank_code"],
+                reported_customer_cif=None,
+                fraud_type=state.fields.get("fraud_type") or "OTHER",
+                contact_channel=state.fields["contact_channel"],
+                aftermath=state.fields["aftermath"],
+                reason_text=state.fields["reason_text"],
+                has_evidence=bool(state.fields["has_evidence"]),
+                confidence_score=scoring["confidence_score"],
+                status=scoring["status"],
+            )
+            trace.append("persist_fraud_report")
+
+            # Update reported_accounts aggregate
+            tx_amount = verification.get("transaction_amount")
+            self.store.update_reported_account_aggregate(
+                account_no=state.fields["reported_account_no"],
+                bank_code=state.fields["reported_bank_code"],
+                confidence_score=scoring["confidence_score"],
+                reporter_cif_no=user_id,
+                amount=int(tx_amount) if tx_amount else None,
+            )
+            trace.append("update_reported_accounts_aggregate")
+        except Exception as exc:
+            logger.error("[FRAUD] persist failed: %s", exc, exc_info=True)
+            report_id = None
+
         self.session_store.clear(user_id, session_id)
 
         logger.info(
