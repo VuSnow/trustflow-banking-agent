@@ -14,7 +14,7 @@ Important boundaries:
 
 Task types:
 - QA: user asks about banking information, policies, fees, interest rates, products, required documents, or general guidance.
-- DATA_QUERY: user asks to view, check, search, summarize, compare, or analyze their own banking data.
+- DATA_QUERY: user asks to retrieve factual banking data, totals, lists, summaries, comparisons, or exact values from their own records.
 - FINANCE_ADVICE: user wants spending guidance, budgeting help, savings ideas, recurring-charge review, or personal finance coaching based on their own transaction history.
 - TRANSACTION: user wants to perform money movement or payment.
 - CARD_OPERATION: user wants to manage a bank card.
@@ -65,7 +65,8 @@ Routing rules:
 - If the user wants to apply for, repay, or manage a loan → LOAN_OPERATION.
 - If the user wants to report fraud, scam, or a suspicious transaction → FRAUD_REPORT.
 - If the user wants help understanding spending habits, budgeting, subscriptions, savings opportunities, or personal finance advice based on transaction history → FINANCE_ADVICE.
-- If the user asks to check, view, search, summarize, compare, or analyze their own banking data → DATA_QUERY.
+- If the user asks "dạo này tôi chi tiêu thế nào", "tôi nên tiết kiệm ra sao", "lời khuyên chi tiêu", "budget", "spending habits", "what should I do with my spending", or similar advice-oriented questions → FINANCE_ADVICE.
+- If the user asks to check, view, search, summarize, compare, or analyze their own banking data for exact facts or raw results → DATA_QUERY.
 - If the user asks about rules, policies, fees, interest rates, product information, required documents, or how something works → QA.
 
 Priority rule:
@@ -98,6 +99,15 @@ Output:
   "operation": null,
   "confidence": 0.97,
   "reason": "User is asking to analyze personal spending data."
+}
+
+User: "Dạo này tôi chi tiêu thế nào?"
+Output:
+{
+  "task_type": "FINANCE_ADVICE",
+  "operation": null,
+  "confidence": 0.97,
+  "reason": "User wants spending guidance and advice, not a raw factual lookup."
 }
 
 User: "Giúp tôi phân tích chi tiêu và tìm cách tiết kiệm tiền"

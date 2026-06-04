@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from openai import AsyncOpenAI
 
@@ -10,6 +11,8 @@ from backend.prompts.finance_advice import (
     FINANCE_CHAT_SYSTEM_PROMPT,
     FINANCE_CHAT_USER_TEMPLATE,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ChatAgent:
@@ -33,6 +36,11 @@ class ChatAgent:
 
         if self.client is not None:
             try:
+                logger.info(
+                    "[FINANCE][chat_agent] composing advice with model=%s lookback_days=%s",
+                    OPENAI_MODEL,
+                    lookback_days,
+                )
                 response = await self.client.chat.completions.create(
                     model=OPENAI_MODEL,
                     messages=[
@@ -51,12 +59,17 @@ class ChatAgent:
                     temperature=0.2,
                 )
                 advice = response.choices[0].message.content.strip()
+                logger.info("[FINANCE][chat_agent] llm advice=%s", advice)
                 return AgentTaskResult(
                     status="success",
                     result={"advice": advice, "mode": "llm"},
                     confidence=0.92,
                 )
             except Exception:
+                logger.warning(
+                    "[FINANCE][chat_agent] llm generation failed; using fallback",
+                    exc_info=False,
+                )
                 pass
 
         advice_lines = [
@@ -100,8 +113,11 @@ class ChatAgent:
             "và tự động chuyển một phần thu nhập sang tiết kiệm ngay khi nhận lương."
         )
 
+        advice_text = "\n".join(advice_lines)
+        logger.info("[FINANCE][chat_agent] fallback advice=%s", advice_text)
+
         return AgentTaskResult(
             status="success",
-            result={"advice": "\n".join(advice_lines), "mode": "fallback"},
+            result={"advice": advice_text, "mode": "fallback"},
             confidence=0.88,
         )

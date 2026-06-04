@@ -42,18 +42,20 @@ class FinanceAdvisorAgent:
     async def run(self, message: str, user_id: str, session_id: str) -> DomainAgentOutput:
         trace: list[str] = []
         lookback_days = parse_lookback_days(message, default_days=30)
+        logger.info(
+            "[FINANCE] start user=%s session=%s lookback_days=%s message=%r",
+            user_id,
+            session_id,
+            lookback_days,
+            message,
+        )
 
         transactions = self.transaction_store.load_user_transactions(
             user_id=user_id,
             lookback_days=lookback_days,
         )
         trace.append("load_transactions")
-        logger.info(
-            "[FINANCE] user=%s lookback_days=%s transactions=%s",
-            user_id,
-            lookback_days,
-            len(transactions),
-        )
+        logger.info("[FINANCE] loaded transactions=%s", len(transactions))
 
         categorizer = self.registry.get("categorizer")
         pattern_detector = self.registry.get("pattern_detector")
@@ -62,6 +64,8 @@ class FinanceAdvisorAgent:
         savings_opportunity = self.registry.get("savings_opportunity")
         chat_agent = self.registry.get("chat_agent")
 
+        step_outputs: dict[str, dict] = {}
+
         categorization = await categorizer.execute_task(
             AgentTask(
                 task_type="categorize_transactions",
@@ -69,6 +73,13 @@ class FinanceAdvisorAgent:
             )
         )
         trace.append("categorize_transactions")
+        step_outputs["categorize_transactions"] = _safe_json(
+            {
+                "status": categorization.status,
+                "confidence": categorization.confidence,
+                "result": categorization.result,
+            }
+        )
 
         categorized_transactions = categorization.result.get("categorized_transactions", [])
         pattern_result = await pattern_detector.execute_task(
@@ -78,6 +89,13 @@ class FinanceAdvisorAgent:
             )
         )
         trace.append("detect_patterns")
+        step_outputs["detect_patterns"] = _safe_json(
+            {
+                "status": pattern_result.status,
+                "confidence": pattern_result.confidence,
+                "result": pattern_result.result,
+            }
+        )
 
         subscription_result = await subscription_tracker.execute_task(
             AgentTask(
@@ -86,6 +104,13 @@ class FinanceAdvisorAgent:
             )
         )
         trace.append("track_subscriptions")
+        step_outputs["track_subscriptions"] = _safe_json(
+            {
+                "status": subscription_result.status,
+                "confidence": subscription_result.confidence,
+                "result": subscription_result.result,
+            }
+        )
 
         budget_result = await budget_analyzer.execute_task(
             AgentTask(
@@ -97,6 +122,13 @@ class FinanceAdvisorAgent:
             )
         )
         trace.append("analyze_budget")
+        step_outputs["analyze_budget"] = _safe_json(
+            {
+                "status": budget_result.status,
+                "confidence": budget_result.confidence,
+                "result": budget_result.result,
+            }
+        )
 
         savings_result = await savings_opportunity.execute_task(
             AgentTask(
@@ -109,6 +141,13 @@ class FinanceAdvisorAgent:
             )
         )
         trace.append("find_savings_opportunities")
+        step_outputs["find_savings_opportunities"] = _safe_json(
+            {
+                "status": savings_result.status,
+                "confidence": savings_result.confidence,
+                "result": savings_result.result,
+            }
+        )
 
         analysis_bundle = {
             "lookback_days": lookback_days,
@@ -153,6 +192,13 @@ class FinanceAdvisorAgent:
             )
         )
         trace.append("compose_advice")
+        step_outputs["compose_advice"] = _safe_json(
+            {
+                "status": chat_result.status,
+                "confidence": chat_result.confidence,
+                "result": chat_result.result,
+            }
+        )
 
         markdown_report = self._build_markdown_report(
             user_id=user_id,
@@ -173,15 +219,53 @@ class FinanceAdvisorAgent:
         }
         report_meta = self.report_writer.write(user_id, report_payload)
 
+        trace_meta = self.report_writer.write_trace_pipeline(
+            user_id=user_id,
+            payload={
+                "user_id": user_id,
+                "session_id": session_id,
+                "message": message,
+                "lookback_days": lookback_days,
+                "trace": trace,
+                "steps": step_outputs,
+                "analysis": analysis_bundle,
+                "final_output": {
+                    "status": "info_response",
+                    "advisory_text": chat_result.result.get("advice", ""),
+                    "report": report_meta,
+                },
+            },
+        )
+
         response_data = {
             "advisory_text": chat_result.result.get("advice", ""),
             "report": report_meta,
+            "trace_pipeline": trace_meta,
             "analysis": analysis_bundle,
             "lookback_days": lookback_days,
             "transaction_count": len(transactions),
             "trace": trace,
             "prompt_reference": FINANCE_CHAT_SYSTEM_PROMPT.strip().splitlines()[0],
         }
+        logger.info(
+            "[FINANCE] complete report_id=%s trace_file=%s",
+            report_meta["report_id"],
+            trace_meta["trace_json_path"],
+        )
+        logger.info(
+            "[FINANCE] pipeline output=%s",
+            json.dumps(
+                _safe_json(
+                    {
+                        "status": "info_response",
+                        "advisory_text": chat_result.result.get("advice", ""),
+                        "report_id": report_meta["report_id"],
+                        "trace_file": trace_meta["trace_json_path"],
+                    }
+                ),
+                ensure_ascii=False,
+            ),
+        )
 
         return DomainAgentOutput(
             status="info_response",
@@ -302,3 +386,14 @@ class FinanceAdvisorAgent:
         )
 
         return "\n".join(lines)
+
+
+def _safe_json(value):
+    """Best-effort JSON-safe conversion for logging."""
+    if isinstance(value, dict):
+        return {k: _safe_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_safe_json(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)

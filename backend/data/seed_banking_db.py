@@ -61,6 +61,39 @@ CREATE TABLE IF NOT EXISTS reported_accounts (
     reported_at TEXT,
     severity TEXT DEFAULT 'high'
 );
+
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    session_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    title TEXT,
+    status TEXT DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_message_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    role TEXT NOT NULL,
+    message TEXT NOT NULL,
+    data_json TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fraud_report_sessions (
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    session_id TEXT NOT NULL,
+    fields_json TEXT NOT NULL DEFAULT '{}',
+    stage TEXT NOT NULL DEFAULT 'collect_account',
+    candidate_transactions_json TEXT NOT NULL DEFAULT '[]',
+    selected_transaction_ref TEXT,
+    last_prompt TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, session_id)
+);
 """
 
 
