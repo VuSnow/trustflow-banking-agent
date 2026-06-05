@@ -102,12 +102,17 @@ class ActionDraft(BaseModel):
     recipient_name: str | None = None
     recipient_account: str | None = None
     recipient_bank: str | None = None
+    bank_name: str | None = None
+    transfer_type: Literal["intrabank", "interbank"] | None = None
     note: str | None = None
+    resolution_source: str | None = None
+    confidence: float | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class FraudReportExtraction(BaseModel):
     """Typed extraction for fraud-report intake."""
-    operation: Literal["REPORT_FRAUD", "CHECK_FRAUD_STATUS"] = "REPORT_FRAUD"
+    operation: Literal["REPORT_FRAUD", "CHECK_FRAUD_STATUS", "CHECK_ACCOUNT_RISK"] = "REPORT_FRAUD"
     fraud_type: str | None = None
     reported_account_no: str | None = None
     reported_bank_code: str | None = None
@@ -161,7 +166,7 @@ class AgentTaskResult(BaseModel):
 
 class PlanStep(BaseModel):
     """A single resolution step in an agent plan."""
-    agent: str                        # registry key: "recipient_resolution", "text2sql"
+    agent: str                        # registry key: "text2sql", "fraud_screening"
     task_type: str                    # "resolve_by_name", "query_evidence", etc.
     input_from: str | None = None     # "extraction" | "step_0" | "step_1"
     constraints: dict = Field(default_factory=dict)
@@ -178,9 +183,73 @@ class AgentPlan(BaseModel):
 class DomainAgentOutput(BaseModel):
     """Standard output of any domain agent. Orchestrator doesn't care
     which agent produced it — same shape regardless."""
-    status: Literal["draft_ready", "clarification_needed", "info_response"]
+    status: Literal["draft_ready", "clarification_needed", "needs_otp", "info_response"]
     action_draft: ActionDraft | None = None
     clarification_message: str | None = None
     info_response: str | None = None
     response_data: dict | None = None
     delegation_trace: list[str] = Field(default_factory=list)
+
+
+# ─── Pipeline models ─────────────────────────────────────────────────────────
+
+
+class PipelineStep(BaseModel):
+    """A single step in a multi-agent pipeline."""
+    agent: str                       # "QA", "DATA_QUERY", "TRANSACTION", etc.
+    message: str                     # the sub-message for this agent
+    depends_on_previous: bool = False  # True if this step needs output from prior step
+    condition: Literal["always", "previous_success", "previous_safe"] | None = None
+    reason: str = ""                 # why this step is needed
+
+
+class PipelinePlan(BaseModel):
+    """Multi-step plan produced by orchestrator."""
+    steps: list[PipelineStep] = Field(default_factory=list)
+    is_multi_intent: bool = False
+    confidence: float = 0.9
+
+
+class PipelineState(BaseModel):
+    """Persisted state for a multi-turn pipeline execution.
+
+    Tracks which steps have completed, which step is currently active,
+    and accumulated context across steps. Stored in session metadata.
+    """
+    plan: PipelinePlan
+    current_step_index: int = 0
+    step_results: list[dict] = Field(default_factory=list)
+    status: Literal["running", "waiting_user", "completed", "failed"] = "running"
+    waiting_reason: str | None = None  # clarification/confirmation message
+
+
+class TransactionState(BaseModel):
+    """Persistent state for transaction workflow (FSM + draft snapshot).
+
+    Saved when agent produces a draft and OTP is required.
+    Used to guarantee draft integrity when user provides OTP —
+    backend uses this saved draft instead of trusting LLM reconstruction.
+    """
+    session_id: str
+    user_id: str
+    fsm_state: Literal[
+        "WAITING_CONFIRMATION",
+        "WAITING_OTP",
+        "OTP_VERIFIED",
+        "CANCELLED",
+        "BLOCKED",
+    ] = "WAITING_CONFIRMATION"
+
+    # Frozen draft snapshot from verified tools
+    draft: dict = Field(default_factory=dict)
+
+    # Fraud screening result (frozen from check_fraud_risk tool)
+    fraud_screening: dict | None = None
+    risk_level: str | None = None
+    warning_message: str | None = None
+
+    # OTP tracking
+    otp_attempts: int = 0
+    max_otp_attempts: int = 3
+    otp_created_at: str | None = None
+    otp_expires_seconds: int = 300  # 5 minutes

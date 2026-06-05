@@ -188,6 +188,102 @@ class ChatSessionStore:
         finally:
             conn.close()
 
+    # ─── Pipeline state persistence ──────────────────────────────────────────
+
+    def get_pipeline_state(self, session_id: str) -> dict | None:
+        """Retrieve active pipeline state for a session."""
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT pipeline_state FROM chat_sessions
+                    WHERE session_id = %s
+                    """,
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                if row and row["pipeline_state"]:
+                    state = row["pipeline_state"]
+                    # psycopg2 auto-parses JSONB to dict; handle str just in case
+                    if isinstance(state, str):
+                        return json.loads(state)
+                    return state
+            return None
+        finally:
+            conn.close()
+
+    def set_pipeline_state(self, session_id: str, state: dict | None) -> None:
+        """Store or clear pipeline state for a session."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE chat_sessions
+                    SET pipeline_state = %s, updated_at = %s
+                    WHERE session_id = %s
+                    """,
+                    (
+                        json.dumps(state, ensure_ascii=False) if state else None,
+                        self._now(),
+                        session_id,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def clear_pipeline_state(self, session_id: str) -> None:
+        """Clear pipeline state when pipeline completes or is cancelled."""
+        self.set_pipeline_state(session_id, None)
+
+    # ─── Transaction state persistence (FSM + draft snapshot) ────────────────
+
+    def get_transaction_state(self, session_id: str) -> dict | None:
+        """Retrieve active transaction state for a session."""
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT transaction_state FROM chat_sessions WHERE session_id = %s",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                if row and row["transaction_state"]:
+                    state = row["transaction_state"]
+                    if isinstance(state, str):
+                        return json.loads(state)
+                    return state
+            return None
+        finally:
+            conn.close()
+
+    def set_transaction_state(self, session_id: str, state: dict | None) -> None:
+        """Store or clear transaction state for a session."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE chat_sessions
+                    SET transaction_state = %s, updated_at = %s
+                    WHERE session_id = %s
+                    """,
+                    (
+                        json.dumps(state, ensure_ascii=False) if state else None,
+                        self._now(),
+                        session_id,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def clear_transaction_state(self, session_id: str) -> None:
+        """Clear transaction state when transaction completes or is cancelled."""
+        self.set_transaction_state(session_id, None)
+
     def _connect(self):
         return psycopg2.connect(self.dsn)
 

@@ -19,7 +19,7 @@ class QAAgent:
             AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
         )
 
-    async def run(self, message: str, user_id: str, session_id: str) -> DomainAgentOutput:
+    async def run(self, message: str, user_id: str, session_id: str, history: list[dict] | None = None, pipeline_context: dict | None = None) -> DomainAgentOutput:
         if self.client is not None:
             try:
                 response = await self.client.chat.completions.create(

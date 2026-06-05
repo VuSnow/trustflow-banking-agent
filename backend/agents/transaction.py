@@ -1,7 +1,16 @@
-"""TransactionAgent — domain agent for TRANSACTION intent.
+"""TransactionAgent — agentic tool-calling agent for TRANSACTION intent.
 
-Phase 3: hardcoded resolution flow (extract → resolve → build draft).
-Phase 6: refactored to dynamic LLM planning.
+Uses a ReAct-style loop: LLM reasons about what to do, calls tools,
+observes results, and repeats until it has enough info to build a draft
+or needs to ask the user for clarification.
+
+Architecture:
+- text2sql_query: primary resolution tool (beneficiaries, history, bank codes)
+- verify_recipient: mandatory account verification before draft
+- check_fraud_risk: mandatory fraud screening before draft
+- Backend (main.py) owns: FSM state, frozen draft, confirmation, OTP, execution
+
+This agent NEVER executes transactions or handles OTP.
 """
 import json
 import logging
@@ -10,203 +19,349 @@ from openai import AsyncOpenAI
 
 from backend.config import OPENAI_API_KEY, OPENAI_MODEL
 from backend.models import (
-    TransactionExtraction,
     ActionDraft,
-    AgentPlan,
-    AgentTaskResult,
     DomainAgentOutput,
+    TransactionState,
 )
-from backend.prompts.transaction import TRANSACTION_SYSTEM_PROMPT, TRANSACTION_USER_TEMPLATE
-from backend.prompts.planning import (
-    PLANNING_SYSTEM_PROMPT,
-    PLANNING_USER_TEMPLATE,
-    AGENT_DESCRIPTIONS,
-)
-from backend.agents.registry import AgentRegistry
-from backend.agents.sub_agents.recipient_resolution import RecipientResolutionAgent
-from backend.agents.sub_agents.text2sql_client import Text2SQLSubAgent
-from backend.services.plan_validator import PlanValidator, PlanValidationError
-from backend.services.plan_executor import PlanExecutor
+from backend.agents.tools.transaction_tools import TRANSACTION_TOOLS, TOOL_FUNCTIONS
+from backend.prompts.transaction import TRANSACTION_AGENT_SYSTEM_PROMPT
+from backend.services.guardrails import check_transaction_guardrails
+from backend.services.chat_session_store import ChatSessionStore
+from backend.services.audit_log import write_audit_log
 
 logger = logging.getLogger(__name__)
 
-# Allowlisted agents for TransactionAgent planning
-TRANSACTION_ALLOWED_AGENTS = {"recipient_resolution", "text2sql"}
+# Safety: max iterations to prevent infinite loops
+MAX_AGENT_ITERATIONS = 8
 
 
 class TransactionAgent:
-    """Domain agent for TRANSACTION intent.
-
-    Uses LLM to generate a resolution plan, validates it, then executes
-    sub-agents to resolve missing fields before building ActionDraft.
-    """
+    """Agentic transaction agent with tool-calling loop + hard guardrails."""
 
     def __init__(self, client: AsyncOpenAI | None = None):
         self.client = client or AsyncOpenAI(api_key=OPENAI_API_KEY)
+        self._session_store = ChatSessionStore()
 
-        # Build registry
-        self.registry = AgentRegistry()
-        self.registry.register("recipient_resolution", RecipientResolutionAgent())
-        self.registry.register("text2sql", Text2SQLSubAgent())
+    async def run(
+        self,
+        message: str,
+        user_id: str,
+        session_id: str,
+        history: list[dict] | None = None,
+        pipeline_context: dict | None = None,
+    ) -> DomainAgentOutput:
+        """Run the agent loop.
 
-        self.plan_validator = PlanValidator()
-        self.plan_executor = PlanExecutor(self.registry)
-
-    async def run(self, message: str, user_id: str, session_id: str) -> DomainAgentOutput:
+        Args:
+            message: Current user message.
+            user_id: User identifier (cif_no).
+            session_id: Chat session identifier.
+            history: Recent chat history [{"role": "user"|"assistant", "message": "..."}].
+        """
         trace = []
 
-        # 1. LLM extract → TransactionExtraction
-        extraction = await self._extract_entities(message)
-        trace.append("extract_entities")
-        logger.info(f"[TX EXTRACT] {extraction.model_dump_json()}")
+        # Build messages for the agent
+        messages = [{"role": "system", "content": TRANSACTION_AGENT_SYSTEM_PROMPT}]
 
-        # 2. Early exit if extraction needs clarification (unresolvable)
-        if extraction.needs_clarification and not extraction.resolvable_fields:
-            return DomainAgentOutput(
-                status="clarification_needed",
-                clarification_message=extraction.clarification_reason or "Vui lòng cung cấp thêm thông tin.",
-                delegation_trace=trace,
+        # Inject history for multi-turn context
+        if history:
+            for msg in history[-10:]:
+                role = msg.get("role", "user")
+                content = msg.get("message", "")
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content})
+
+        # Current user message
+        messages.append({"role": "user", "content": message})
+
+        # Convert tools to OpenAI function format
+        openai_tools = self._build_openai_tools()
+
+        # Agent loop
+        context = {"user_id": user_id, "session_id": session_id}
+        for iteration in range(MAX_AGENT_ITERATIONS):
+            trace.append(f"iteration_{iteration}")
+
+            response = await self.client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                tools=openai_tools,
+                tool_choice="auto",
+                temperature=0.0,
             )
 
-        # 3. Generate resolution plan (LLM)
-        plan = await self._generate_plan(extraction)
-        trace.append("generate_plan")
-        logger.info(f"[TX PLAN] {plan.model_dump_json()}")
+            choice = response.choices[0]
 
-        # 4. Validate plan (fixed safety)
-        try:
-            plan = self.plan_validator.validate(plan, TRANSACTION_ALLOWED_AGENTS)
-            trace.append("validate_plan")
-        except PlanValidationError as e:
-            logger.error(f"[TX PLAN] Validation failed: {e}")
-            # Fallback: return clarification
-            return DomainAgentOutput(
-                status="clarification_needed",
-                clarification_message="Không thể xử lý yêu cầu. Vui lòng thử lại.",
-                delegation_trace=trace,
-            )
+            # Case 1: LLM wants to call tools
+            if choice.message.tool_calls:
+                messages.append(choice.message)
 
-        # 5. Execute plan (dynamic)
-        if plan.steps:
-            results = await self.plan_executor.execute(
-                plan, {"user_id": user_id, "extraction": extraction.model_dump()}
-            )
-            trace.append("execute_plan")
+                for tool_call in choice.message.tool_calls:
+                    fn_name = tool_call.function.name
+                    fn_args = json.loads(tool_call.function.arguments)
+                    trace.append(f"tool:{fn_name}")
+                    logger.info(f"[TX AGENT] Tool call: {fn_name}({fn_args})")
 
-            # Check for clarification in any step result
-            for step_key, result in results.items():
-                if result.status == "needs_clarification":
-                    return DomainAgentOutput(
-                        status="clarification_needed",
-                        clarification_message=result.result.get("message", "Cần thêm thông tin."),
-                        delegation_trace=trace,
-                    )
+                    # Execute tool
+                    tool_fn = TOOL_FUNCTIONS.get(fn_name)
+                    if tool_fn:
+                        result = await tool_fn(fn_args, context)
+                    else:
+                        result = {"error": f"Unknown tool: {fn_name}"}
 
-            # Merge resolved data back into extraction
-            extraction = self._merge_results(extraction, results)
+                    logger.info(f"[TX AGENT] Tool result: {result}")
 
-        # 6. Validate required fields after resolution
-        if not extraction.amount:
-            return DomainAgentOutput(
-                status="clarification_needed",
-                clarification_message="Bạn muốn chuyển bao nhiêu?",
-                delegation_trace=trace,
-            )
-        if not extraction.recipient_account and not extraction.recipient_hint:
-            return DomainAgentOutput(
-                status="clarification_needed",
-                clarification_message="Bạn muốn chuyển cho ai?",
-                delegation_trace=trace,
-            )
+                    # Append tool result back to messages
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                    })
 
-        # 7. Build typed ActionDraft
-        draft = ActionDraft(
-            action_type="TRANSACTION",
-            operation=extraction.action,
-            amount=extraction.amount,
-            currency=extraction.currency,
-            recipient_name=extraction.recipient_hint,
-            recipient_account=extraction.recipient_account,
-            recipient_bank=extraction.recipient_bank,
-            note=extraction.note,
-        )
-        trace.append("build_draft")
+                continue  # Next iteration — let LLM process tool results
 
+            # Case 2: LLM produced a final response (no tool calls)
+            raw_content = choice.message.content
+            trace.append("final_response")
+            logger.info(f"[TX AGENT] Final: {raw_content}")
+
+            return self._process_final_response(raw_content, trace, context)
+
+        # Max iterations reached
+        logger.warning("[TX AGENT] Max iterations reached")
         return DomainAgentOutput(
-            status="draft_ready",
-            action_draft=draft,
+            status="clarification_needed",
+            clarification_message="Xin lỗi, tôi không thể xử lý yêu cầu này lúc này. Vui lòng thử lại.",
             delegation_trace=trace,
         )
 
-    async def _extract_entities(self, message: str) -> TransactionExtraction:
-        """Call LLM to extract transaction entities."""
+    def _process_final_response(
+        self, raw: str, trace: list[str], context: dict
+    ) -> DomainAgentOutput:
+        """Parse the agent's final JSON response and apply guardrails."""
         try:
-            response = await self.client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": TRANSACTION_SYSTEM_PROMPT},
-                    {"role": "user", "content": TRANSACTION_USER_TEMPLATE.format(
-                        message=message)},
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"},
-            )
-            raw = response.choices[0].message.content
-            logger.info(f"[TX EXTRACT RAW] {raw}")
-            data = json.loads(raw)
-            return TransactionExtraction(**data)
-        except Exception as e:
-            logger.error(f"Extraction error: {e}", exc_info=True)
-            return TransactionExtraction(
-                action="UNKNOWN",
-                needs_clarification=True,
-                clarification_reason="Không thể phân tích yêu cầu. Vui lòng thử lại.",
-                confidence=0.0,
+            data = json.loads(self._strip_markdown_fences(raw))
+        except (json.JSONDecodeError, TypeError):
+            # LLM returned free text — treat as clarification
+            return DomainAgentOutput(
+                status="clarification_needed",
+                clarification_message=raw or "Vui lòng cung cấp thêm thông tin.",
+                delegation_trace=trace,
             )
 
-    async def _generate_plan(self, extraction: TransactionExtraction) -> AgentPlan:
-        """Call LLM to generate a resolution plan based on extraction."""
-        try:
-            system_prompt = PLANNING_SYSTEM_PROMPT.replace(
-                "__AGENTS__", AGENT_DESCRIPTIONS
+        status = data.get("status", "")
+        session_id = context.get("session_id", "")
+        user_id = context.get("user_id", "")
+
+        # ─── Cancelled ───────────────────────────────────────────────────
+        if status == "cancelled":
+            trace.append("user_cancelled")
+            self._session_store.clear_transaction_state(session_id)
+            write_audit_log(
+                cif_no=user_id,
+                event_type="TRANSACTION_CANCELLED",
+                actor="agent",
+                session_id=session_id,
+                event_payload={"reason": "user_requested_cancel"},
             )
-            user_prompt = PLANNING_USER_TEMPLATE.replace(
-                "__EXTRACTION__", extraction.model_dump_json(indent=2)
+            return DomainAgentOutput(
+                status="info_response",
+                info_response=data.get("message", "Đã hủy giao dịch."),
+                response_data={"operation": "TRANSACTION_CANCELLED"},
+                delegation_trace=trace,
             )
 
-            response = await self.client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"},
+        # ─── Needs clarification ─────────────────────────────────────────
+        if status == "needs_clarification":
+            msg = data.get("message", "Vui lòng cung cấp thêm thông tin.")
+            return DomainAgentOutput(
+                status="clarification_needed",
+                clarification_message=msg,
+                response_data={
+                    "reason": data.get("reason"),
+                    "candidates": data.get("candidates"),
+                    "missing_fields": data.get("missing_fields"),
+                },
+                delegation_trace=trace,
             )
-            raw = response.choices[0].message.content
-            logger.info(f"[TX PLAN RAW] {raw}")
-            data = json.loads(raw)
-            return AgentPlan(**data)
-        except Exception as e:
-            logger.error(f"Planning error: {e}", exc_info=True)
-            # Fallback: empty plan (proceed with what we have)
-            return AgentPlan(steps=[], confidence=0.0)
 
-    def _merge_results(
-        self, extraction: TransactionExtraction, results: dict[str, AgentTaskResult]
-    ) -> TransactionExtraction:
-        """Merge successful resolution results back into extraction."""
-        for step_key, result in results.items():
-            if result.status != "success":
-                continue
+        # ─── Needs confirmation (name mismatch etc.) ─────────────────────
+        if status == "needs_confirmation":
+            msg = data.get("message", "Vui lòng xác nhận.")
+            return DomainAgentOutput(
+                status="clarification_needed",
+                clarification_message=msg,
+                response_data={
+                    "reason": data.get("reason"),
+                    "candidate": data.get("candidate"),
+                    "warnings": data.get("warnings", []),
+                    "requires_user_confirmation": True,
+                },
+                delegation_trace=trace,
+            )
 
-            data = result.result
-            # Merge recipient fields if resolved
-            if "account_number" in data:
-                extraction.recipient_account = data["account_number"]
-            if "bank_name" in data:
-                extraction.recipient_bank = data["bank_name"]
-            if "recipient_name" in data:
-                extraction.recipient_hint = data["recipient_name"]
+        # ─── Draft created — apply guardrails ────────────────────────────
+        if status == "draft_created":
+            draft = self._build_draft(data)
+            trace.append("build_draft")
 
-        return extraction
+            # Guardrails
+            fraud_data = data.get("fraud_screening") or context.get("fraud_screening")
+            guardrail = check_transaction_guardrails(
+                amount=draft.amount,
+                fraud_screening=fraud_data,
+                otp_verified=False,
+            )
+
+            # BLOCK: reject outright
+            if guardrail.blocked:
+                trace.append("guardrail_blocked")
+                write_audit_log(
+                    cif_no=user_id,
+                    event_type="TRANSACTION_BLOCKED",
+                    actor="guardrail",
+                    session_id=session_id,
+                    event_payload={
+                        "reason": guardrail.reason,
+                        "risk_level": guardrail.risk_level,
+                        "draft": draft.model_dump(),
+                    },
+                )
+                return DomainAgentOutput(
+                    status="info_response",
+                    info_response=guardrail.reason,
+                    response_data={
+                        **draft.model_dump(),
+                        "blocked": True,
+                        "risk_level": guardrail.risk_level,
+                    },
+                    delegation_trace=trace,
+                )
+
+            # ALL transactions require confirmation → OTP
+            trace.append("guardrail_confirmation_required")
+
+            # Persist frozen transaction state
+            tx_state = TransactionState(
+                session_id=session_id,
+                user_id=user_id,
+                fsm_state="WAITING_CONFIRMATION",
+                draft=draft.model_dump(),
+                fraud_screening=fraud_data,
+                risk_level=guardrail.risk_level,
+                warning_message=guardrail.warning_message,
+            )
+            self._session_store.set_transaction_state(session_id, tx_state.model_dump())
+
+            # Audit: draft created
+            write_audit_log(
+                cif_no=user_id,
+                event_type="TRANSACTION_DRAFT_CREATED",
+                actor="agent",
+                session_id=session_id,
+                event_payload={
+                    "draft": draft.model_dump(),
+                    "risk_level": guardrail.risk_level,
+                    "resolution_source": draft.resolution_source,
+                    "warnings": draft.warnings,
+                },
+            )
+
+            logger.info(f"[TX AGENT] Draft frozen: WAITING_CONFIRMATION session={session_id}")
+
+            # Build confirmation message
+            confirm_msg = self._build_confirmation_message(draft, guardrail.warning_message)
+
+            return DomainAgentOutput(
+                status="clarification_needed",
+                clarification_message=confirm_msg,
+                response_data={
+                    **draft.model_dump(),
+                    "fraud_screening": fraud_data,
+                    "warning_message": guardrail.warning_message,
+                    "requires_confirmation": True,
+                    "risk_level": guardrail.risk_level,
+                    "fsm_state": "WAITING_CONFIRMATION",
+                },
+                delegation_trace=trace,
+            )
+
+        # ─── Unknown status — treat as clarification ─────────────────────
+        msg = data.get("message") or data.get("clarification_message") or "Vui lòng cung cấp thêm thông tin."
+        return DomainAgentOutput(
+            status="clarification_needed",
+            clarification_message=msg,
+            delegation_trace=trace,
+        )
+
+    def _build_draft(self, data: dict) -> ActionDraft:
+        """Build ActionDraft from agent output data."""
+        return ActionDraft(
+            action_type="TRANSACTION",
+            operation="TRANSFER_MONEY",
+            amount=data.get("amount"),
+            currency=data.get("currency", "VND"),
+            recipient_name=data.get("recipient_name"),
+            recipient_account=data.get("account_no"),
+            recipient_bank=data.get("bank_code"),
+            bank_name=data.get("bank_name"),
+            transfer_type=data.get("transfer_type"),
+            note=data.get("note"),
+            resolution_source=data.get("resolution_source"),
+            confidence=data.get("confidence"),
+            warnings=data.get("warnings") or [],
+        )
+
+    def _build_confirmation_message(self, draft: ActionDraft, warning: str | None) -> str:
+        """Build a human-readable confirmation message from the frozen draft."""
+        parts = ["Vui lòng xác nhận thông tin giao dịch:\n"]
+        parts.append(f"• Người nhận: **{draft.recipient_name}**")
+        parts.append(f"• Số tài khoản: **{draft.recipient_account}**")
+
+        bank_display = draft.bank_name or draft.recipient_bank or ""
+        if draft.recipient_bank and draft.bank_name:
+            bank_display = f"{draft.bank_name} ({draft.recipient_bank})"
+        parts.append(f"• Ngân hàng: **{bank_display}**")
+
+        if draft.amount:
+            parts.append(f"• Số tiền: **{draft.amount:,} {draft.currency}**")
+
+        transfer_label = "Nội bộ SHB" if draft.transfer_type == "intrabank" else "Liên ngân hàng"
+        parts.append(f"• Loại: {transfer_label}")
+
+        if draft.note:
+            parts.append(f"• Nội dung: {draft.note}")
+
+        if draft.warnings:
+            for w in draft.warnings:
+                parts.append(f"⚠️ {w}")
+
+        if warning:
+            parts.append(f"\n{warning}")
+
+        parts.append("\nBạn xác nhận chuyển tiền không?")
+        return "\n".join(parts)
+
+    def _build_openai_tools(self) -> list[dict]:
+        """Convert TRANSACTION_TOOLS to OpenAI tools format."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["parameters"],
+                },
+            }
+            for tool in TRANSACTION_TOOLS
+        ]
+
+    @staticmethod
+    def _strip_markdown_fences(text: str) -> str:
+        """Strip markdown code fences (```json ... ```) from LLM output."""
+        import re
+        stripped = text.strip()
+        match = re.match(r"^```(?:json)?\s*\n?(.*?)\n?\s*```$", stripped, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return stripped

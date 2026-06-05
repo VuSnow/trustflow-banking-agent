@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Transaction Flow — TrustFlow Banking Agent</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body { background: #fff; padding: 20px; font-family: 'Segoe UI', sans-serif; max-width: 1200px; margin: 0 auto; }
+        h1 { text-align: center; color: #1a1a2e; margin-top: 50px; }
+        h1:first-of-type { margin-top: 10px; }
+        .mermaid { display: flex; justify-content: center; margin: 20px 0; }
+        .note { background: #f8f9fa; border-left: 4px solid #0066cc; padding: 12px 16px; margin: 10px 0 30px; font-size: 14px; color: #333; }
+    </style>
+</head>
+<body>
+    <h1>TrustFlow Transaction Agent — Main Flow</h1>
+    <div class="note">
+        TransactionAgent uses a ReAct tool-calling loop (max 8 iterations) with 3 tools:
+        <strong>text2sql_query</strong> (recipient resolution via external text2sql-agent),
+        <strong>verify_recipient</strong> (DB lookup for name verification),
+        <strong>check_fraud_risk</strong> (reported_accounts screening).
+        All transactions require OTP. CRITICAL fraud is blocked outright.
+    </div>
+    <div class="mermaid">
+sequenceDiagram
+    participant U as User
+    participant O as Orchestrator
+    participant TX as TransactionAgent
+    participant LLM as GPT-4o-mini
+    participant T as Tools
+    participant SQL as text2sql-agent<br/>(localhost:8080)
+    participant G as Guardrails
+    participant DB as PostgreSQL
+
+    U->>O: "Chuyển 5tr cho Phúc Vietcombank"
+    O->>TX: route intent=TRANSACTION
+
+    Note over TX,LLM: ReAct Loop (max 8 iterations)
+
+    TX->>LLM: System prompt + user msg + tool definitions
+    LLM->>T: 1. text2sql_query("Tìm beneficiary tên Phúc ngân hàng VCB")
+    T->>SQL: POST /query/execute {question, execute:true}
+    SQL-->>T: [{account_no: "90311860909", bank_code: "VCB", nickname: "Phuc VCB"}]
+    T-->>LLM: query result rows
+
+    LLM->>T: 2. verify_recipient(account_no="90311860909", bank_code="VCB")
+    T->>DB: external_bank_accounts WHERE account_no AND bank_code
+    DB-->>T: {account_holder_name: "TRAN NGOC PHUC", status: "ACTIVE"}
+    T-->>LLM: {resolved_name: "TRAN NGOC PHUC", transfer_type: "interbank"}
+
+    LLM->>T: 3. check_fraud_risk(account_no="90311860909")
+    T->>DB: reported_accounts WHERE account_no
+    DB-->>T: []
+    T-->>LLM: {is_reported: false, risk_level: "LOW", report_count: 0}
+
+    LLM-->>TX: JSON {action:"draft_created", recipient_name, amount, bank_code, ...}
+
+    TX->>TX: _process_final_response() — parse JSON, strip markdown fences
+    TX->>G: check_transaction_guardrails(amount=5000000, fraud_screening)
+    G-->>TX: requires_otp=true, risk_level="LOW"
+
+    TX->>TX: Freeze draft → set FSM="WAITING_CONFIRMATION"
+    TX-->>O: status="needs_confirmation", draft data
+    O-->>U: Xác nhận chuyển 5,000,000 VND cho TRAN NGOC PHUC (VCB)?
+    </div>
+
+    <h1>FSM State Machine — Confirmation &amp; OTP</h1>
+    <div class="note">
+        <strong>WAITING_CONFIRMATION</strong> uses an LLM-based classifier (4 classes: CONFIRM / CANCEL / MODIFY / UNCLEAR).
+        <strong>WAITING_OTP</strong> is fully deterministic — no LLM involved. OTP expires after 300s. Max 3 attempts.
+    </div>
+    <div class="mermaid">
+stateDiagram-v2
+    [*] --> WAITING_CONFIRMATION : Draft frozen
+    WAITING_CONFIRMATION --> WAITING_OTP : CONFIRM (classifier)
+    WAITING_CONFIRMATION --> [*] : CANCEL (classifier)
+    WAITING_CONFIRMATION --> WAITING_CONFIRMATION : MODIFY → ask cancel first
+    WAITING_CONFIRMATION --> WAITING_CONFIRMATION : UNCLEAR → re-ask
+
+    WAITING_OTP --> OTP_VERIFIED : Valid 6-digit OTP
+    WAITING_OTP --> WAITING_OTP : Invalid OTP (attempts < 3)
+    WAITING_OTP --> BLOCKED : 3 failed attempts
+    WAITING_OTP --> BLOCKED : OTP expired (300s)
+    WAITING_OTP --> [*] : User cancels ("hủy")
+
+    OTP_VERIFIED --> [*] : Transaction ready
+    BLOCKED --> [*] : Transaction rejected
+    </div>
+
+    <h1>Confirmation Classifier Flow</h1>
+    <div class="mermaid">
+sequenceDiagram
+    participant U as User
+    participant FSM as FSM Intercept
+    participant CL as ConfirmationClassifier
+    participant LLM as GPT-4o-mini
+    participant AL as AuditLog
+
+    U->>FSM: "ok chuyển đi" (while WAITING_CONFIRMATION)
+    FSM->>CL: classify_confirmation(msg, draft_summary)
+    CL->>LLM: system prompt + user msg + draft context
+    LLM-->>CL: {classification: "CONFIRM", reason: "..."}
+    CL-->>FSM: CONFIRM
+    FSM->>AL: write_audit_log(CONFIRMATION_CLASSIFIED)
+    FSM->>AL: write_audit_log(TRANSACTION_CONFIRMED)
+    FSM-->>U: "Nhập OTP..." (FSM → WAITING_OTP)
+    </div>
+
+    <h1>verify_recipient — Routing Logic</h1>
+    <div class="mermaid">
+flowchart TD
+    A[verify_recipient called<br/>account_no + bank_code] --> B{bank_code == CURRENT_BANK_CODE?<br/>SHB}
+    B -->|Yes — Intrabank| C[accounts JOIN customers<br/>WHERE account_no AND status=ACTIVE]
+    B -->|No — Interbank| E[external_bank_accounts<br/>WHERE account_no AND bank_code]
+    C --> G{Found?}
+    E --> G
+    G -->|Yes + ACTIVE| H[✅ resolved_name + transfer_type]
+    G -->|Yes + INACTIVE/CLOSED| I[⚠️ status=inactive]
+    G -->|No match| J[❌ status=not_found]
+    </div>
+
+    <h1>Guardrails Decision Matrix</h1>
+    <div class="note">
+        ALL non-blocked transactions require OTP (Vietnamese banking standard).
+        Risk level determines the <em>warning message</em> shown before the OTP prompt.
+    </div>
+    <div class="mermaid">
+flowchart TD
+    A[Agent outputs draft_created] --> B[check_transaction_guardrails]
+    B --> C{Fraud risk_level?}
+    C -->|CRITICAL| D[🚫 BLOCK<br/>Transaction rejected<br/>Cannot proceed]
+    C -->|HIGH| E[⚠️ Strong warning<br/>+ require OTP]
+    C -->|MEDIUM| F[⚠️ Mild warning<br/>+ require OTP]
+    C -->|LOW / None| G[Standard flow<br/>require OTP]
+    E --> H[FSM: WAITING_CONFIRMATION]
+    F --> H
+    G --> H
+    H --> I{User confirms?}
+    I -->|CONFIRM| J[FSM: WAITING_OTP]
+    I -->|CANCEL| K[Transaction cancelled]
+    J --> L{Valid OTP?}
+    L -->|Yes| M[✅ OTP_VERIFIED<br/>Transaction ready]
+    L -->|No × 3| N[🚫 BLOCKED]
+    L -->|Expired| N
+    </div>
+
+    <h1>Fraud Screening — check_fraud_risk Tool</h1>
+    <div class="mermaid">
+flowchart LR
+    A[check_fraud_risk<br/>account_no] --> B[Query reported_accounts<br/>WHERE account_no]
+    B --> C{Found reports?}
+    C -->|No| D[is_reported=false<br/>risk_level=LOW]
+    C -->|Yes| E[Count reports<br/>Get max risk_score]
+    E --> F{Max score?}
+    F -->|≥0.8| G[CRITICAL]
+    F -->|≥0.6| H[HIGH]
+    F -->|≥0.3| I[MEDIUM]
+    F -->|Below 0.3| J[LOW]
+    </div>
+
+    <h1>text2sql_query — Recipient Resolution</h1>
+    <div class="note">
+        The agent uses text2sql_query to search beneficiaries/accounts by name, nickname, or partial info.
+        When multiple candidates are found, the agent asks the user to disambiguate.
+    </div>
+    <div class="mermaid">
+sequenceDiagram
+    participant LLM as Agent (GPT-4o-mini)
+    participant T as text2sql_query tool
+    participant SQL as text2sql-agent<br/>(POST /query/execute)
+    participant DB as PostgreSQL
+
+    LLM->>T: text2sql_query("beneficiary named Phúc, bank VCB, cif_no=C001")
+    T->>SQL: {question: "...", execute: true}
+    SQL->>DB: Generated SQL query
+    DB-->>SQL: Result rows
+    SQL-->>T: {columns: [...], rows: [...], sql: "..."}
+    T-->>LLM: Formatted result
+
+    alt Single match
+        LLM->>LLM: Proceed to verify_recipient
+    else Multiple matches
+        LLM-->>LLM: Output "clarification_needed" + candidate list
+    else No match
+        LLM-->>LLM: Ask user for more details
+    end
+    </div>
+
+    <script>mermaid.initialize({startOnLoad: true, theme: 'default'});</script>
+</body>
+</html>

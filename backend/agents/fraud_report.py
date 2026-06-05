@@ -19,6 +19,7 @@ from backend.models import (
 from backend.prompts.fraud_report import (
     FRAUD_REPORT_SYSTEM_PROMPT,
     FRAUD_REPORT_USER_TEMPLATE,
+    FRAUD_RISK_CHECK_SYSTEM_PROMPT,
 )
 from backend.services.fraud_report import (
     FraudConfidenceScorer,
@@ -66,7 +67,7 @@ class FraudReportAgent:
         self.session_store = FraudReportSessionStore()
         self.scorer = FraudConfidenceScorer()
 
-    async def run(self, message: str, user_id: str, session_id: str) -> DomainAgentOutput:
+    async def run(self, message: str, user_id: str, session_id: str, history: list[dict] | None = None, pipeline_context: dict | None = None) -> DomainAgentOutput:
         trace: list[str] = []
         current_state = self.session_store.get(user_id, session_id)
         current_fields = current_state.fields if current_state else {}
@@ -82,16 +83,94 @@ class FraudReportAgent:
         trace.append("extract_fraud_report")
 
         if extraction.operation == "CHECK_FRAUD_STATUS":
+            reports = self.store.get_user_reports(user_id)
+            trace.append("check_fraud_status")
+            if not reports:
+                return DomainAgentOutput(
+                    status="info_response",
+                    info_response="Bạn chưa có báo cáo lừa đảo nào trong hệ thống.",
+                    response_data={
+                        "operation": "CHECK_FRAUD_STATUS",
+                        "reports": [],
+                        "trace": trace,
+                    },
+                    delegation_trace=trace,
+                )
+
+            status_map = {
+                "PENDING": "Đang chờ xử lý",
+                "VALIDATED": "Đã xác nhận",
+                "REVIEWED": "Đã xem xét",
+                "CLOSED": "Đã đóng",
+            }
+            lines = [f"Bạn có {len(reports)} báo cáo lừa đảo:", ""]
+            for i, r in enumerate(reports, 1):
+                status_text = status_map.get(r["status"], r["status"])
+                lines.append(
+                    f"{i}. STK {r['reported_account_no']} ({r['reported_bank_code']}) "
+                    f"— {status_text} — ngày {str(r['created_at'])[:10]}"
+                )
+
             return DomainAgentOutput(
                 status="info_response",
-                info_response=(
-                    "Hiện tại hệ thống chỉ hỗ trợ tạo bản nháp báo cáo lừa đảo, "
-                    "chưa có tra cứu trạng thái báo cáo đã gửi."
-                ),
+                info_response="\n".join(lines),
                 response_data={
                     "operation": "CHECK_FRAUD_STATUS",
-                    "supported": False,
-                    "reason": "fraud report persistence is not implemented in this phase",
+                    "reports": [
+                        {
+                            "report_id": str(r["report_id"]),
+                            "reported_account_no": r["reported_account_no"],
+                            "reported_bank_code": r["reported_bank_code"],
+                            "fraud_type": r["fraud_type"],
+                            "status": r["status"],
+                            "created_at": str(r["created_at"]),
+                        }
+                        for r in reports
+                    ],
+                    "trace": trace,
+                },
+                delegation_trace=trace,
+            )
+
+        if extraction.operation == "CHECK_ACCOUNT_RISK":
+            account_no = extraction.reported_account_no
+            if not account_no:
+                return DomainAgentOutput(
+                    status="clarification_needed",
+                    clarification_message="Bạn muốn kiểm tra tài khoản nào? Vui lòng cung cấp số tài khoản.",
+                    response_data={
+                        "operation": "CHECK_ACCOUNT_RISK",
+                        "trace": trace,
+                    },
+                    delegation_trace=trace,
+                )
+
+            from backend.agents.sub_agents.fraud_screening import FraudScreeningAgent
+            screening = FraudScreeningAgent(store=self.store)
+            screening_result = await screening.execute_task(
+                AgentTask(
+                    task_type="check_account",
+                    constraints={"account_no": account_no},
+                )
+            )
+            trace.append("check_account_risk")
+
+            # Use LLM to generate natural response
+            llm_response = await self._generate_risk_response(
+                message=message,
+                account_no=account_no,
+                screening_data=screening_result.result,
+            )
+            trace.append("llm_risk_response")
+
+            return DomainAgentOutput(
+                status="info_response",
+                info_response=llm_response,
+                response_data={
+                    "operation": "CHECK_ACCOUNT_RISK",
+                    "account_no": account_no,
+                    **screening_result.result,
+                    "trace": trace,
                 },
                 delegation_trace=trace,
             )
@@ -745,3 +824,36 @@ class FraudReportAgent:
             inferred["reason_text"] = message.strip()
 
         return inferred
+
+    async def _generate_risk_response(
+        self,
+        message: str,
+        account_no: str,
+        screening_data: dict,
+    ) -> str:
+        """Use LLM to generate a natural response for account risk check."""
+        is_reported = screening_data.get("is_reported", False)
+        risk_level = screening_data.get("risk_level")
+        report_count = screening_data.get("report_count", 0)
+
+        context = json.dumps({
+            "account_no": account_no,
+            "is_reported": is_reported,
+            "risk_level": risk_level,
+            "report_count": report_count,
+        }, ensure_ascii=False)
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": FRAUD_RISK_CHECK_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Câu hỏi: {message}\n\nDữ liệu kiểm tra: {context}"},
+                ],
+                temperature=0.3,
+                max_tokens=300,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as exc:
+            logger.error("[FRAUD] LLM risk response failed: %s", exc)
+            return screening_data.get("message", "Không thể kiểm tra tại thời điểm này.")

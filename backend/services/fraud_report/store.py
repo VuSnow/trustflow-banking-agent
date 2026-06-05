@@ -130,6 +130,26 @@ class FraudReportStore:
         finally:
             conn.close()
 
+    def get_user_reports(self, user_id: str, limit: int = 10) -> list[dict]:
+        """Get user's own fraud reports (limited fields for privacy)."""
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT report_id, reported_account_no, reported_bank_code,
+                           fraud_type, status, created_at
+                    FROM fraud_reports
+                    WHERE reporter_cif_no = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (user_id, limit),
+                )
+                return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
     def persist_report(
         self,
         *,
@@ -247,10 +267,6 @@ class FraudReportStore:
         row["recipient_bank"] = row.pop("counterparty_bank_code", None) or ""
         row["created_at"] = str(row.get("transaction_time") or row.get("created_at") or "")
         return row
-
-    @staticmethod
-    def format_transaction_ref(transaction_ref: str) -> str:
-        return transaction_ref
 
     @staticmethod
     def _risk_score_to_level(score: float) -> str:

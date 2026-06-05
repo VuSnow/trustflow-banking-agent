@@ -53,6 +53,7 @@ For LOAN_OPERATION:
 For FRAUD_REPORT:
 - REPORT_FRAUD: report a scam, fraud, or suspicious transfer the user was a victim of.
 - CHECK_FRAUD_STATUS: check the status of a previously submitted fraud report.
+- CHECK_ACCOUNT_RISK: user asks whether a specific account is safe, trustworthy, or has been reported as fraud.
 
 For QA and DATA_QUERY:
 - Use operation = null unless there is a clearly useful operation label.
@@ -64,6 +65,7 @@ Routing rules:
 - If the user wants to open, close, update, or manage an account/beneficiary → ACCOUNT_OPERATION.
 - If the user wants to apply for, repay, or manage a loan → LOAN_OPERATION.
 - If the user wants to report fraud, scam, or a suspicious transaction → FRAUD_REPORT.
+- If the user asks whether an account is safe, is a scam, or has been reported → FRAUD_REPORT (CHECK_ACCOUNT_RISK).
 - If the user wants help understanding spending habits, budgeting, subscriptions, savings opportunities, or personal finance advice based on transaction history → FINANCE_ADVICE.
 - If the user asks "dạo này tôi chi tiêu thế nào", "tôi nên tiết kiệm ra sao", "lời khuyên chi tiêu", "budget", "spending habits", "what should I do with my spending", or similar advice-oriented questions → FINANCE_ADVICE.
 - If the user asks to check, view, search, summarize, compare, or analyze their own banking data for exact facts or raw results → DATA_QUERY.
@@ -73,10 +75,17 @@ Priority rule:
 If multiple intents appear, choose the highest-impact task type:
 FRAUD_REPORT > TRANSACTION > CARD_OPERATION > ACCOUNT_OPERATION > LOAN_OPERATION > FINANCE_ADVICE > DATA_QUERY > QA.
 
+Multi-turn context rules:
+- You will receive the recent conversation history as prior messages.
+- If the user's latest message is a short reply (e.g. "xác nhận", "ok", "hủy", "có", "không", "tiếp tục") and the previous assistant message was about a specific task, classify with the SAME task_type as that prior context.
+- If the assistant previously warned about fraud risk on a transaction and the user replies with confirmation/cancellation, classify as TRANSACTION (TRANSFER_MONEY).
+- If the assistant asked a clarifying question about a specific intent, and the user answers that question, classify with the same intent.
+- Only classify as a NEW intent if the user's message clearly introduces a different topic.
+
 Output schema:
 {
   "task_type": "QA | DATA_QUERY | TRANSACTION | CARD_OPERATION | ACCOUNT_OPERATION | LOAN_OPERATION | FINANCE_ADVICE | FRAUD_REPORT",
-  "operation": "TRANSFER_MONEY | BILL_PAYMENT | TOP_UP | LOCK_CARD | UNLOCK_CARD | ACTIVATE_CARD | REISSUE_CARD | CHANGE_CARD_LIMIT | VIEW_CARD_INFO | OPEN_ACCOUNT | CLOSE_ACCOUNT | UPDATE_ACCOUNT_INFO | MANAGE_BENEFICIARY | VIEW_ACCOUNT_INFO | APPLY_LOAN | CHECK_LOAN_STATUS | REPAY_LOAN | VIEW_LOAN_INFO | REPORT_FRAUD | CHECK_FRAUD_STATUS | null",
+  "operation": "TRANSFER_MONEY | BILL_PAYMENT | TOP_UP | LOCK_CARD | UNLOCK_CARD | ACTIVATE_CARD | REISSUE_CARD | CHANGE_CARD_LIMIT | VIEW_CARD_INFO | OPEN_ACCOUNT | CLOSE_ACCOUNT | UPDATE_ACCOUNT_INFO | MANAGE_BENEFICIARY | VIEW_ACCOUNT_INFO | APPLY_LOAN | CHECK_LOAN_STATUS | REPAY_LOAN | VIEW_LOAN_INFO | REPORT_FRAUD | CHECK_FRAUD_STATUS | CHECK_ACCOUNT_RISK | null",
   "confidence": 0.0,
   "reason": "short reason in English"
 }
@@ -238,3 +247,138 @@ Output:
 """
 
 INTENT_USER_TEMPLATE = """User message: {message}"""
+
+
+# ─── Pipeline planning prompt (multi-intent detection) ────────────────────────
+
+PIPELINE_SYSTEM_PROMPT = """
+You are a pipeline planner for a Vietnamese banking assistant.
+
+Your job is to analyze the user's message and determine if it contains MULTIPLE independent intents that require different agents to handle.
+
+Available agents:
+- QA: general banking questions, policies, fees, interest rates
+- DATA_QUERY: retrieve factual data from user's banking records (balances, transaction history, totals, summaries)
+- TRANSACTION: perform money transfers, bill payments, top-ups
+- FINANCE_ADVICE: spending analysis, budgeting, savings guidance
+- FRAUD_REPORT: report fraud, check fraud status, check account risk
+- CARD_OPERATION: lock/unlock/manage cards
+- ACCOUNT_OPERATION: manage accounts and beneficiaries
+- LOAN_OPERATION: loan applications and management
+
+Rules:
+1. Most messages are SINGLE-intent. Return a single step unless you're confident there are multiple distinct intents.
+2. If multiple intents exist, order them logically:
+   - Data retrieval before actions that depend on that data
+   - Safety checks before transactional actions
+   - Informational queries before transactional actions
+3. Set depends_on_previous=true when a step needs output from the prior step.
+4. Each step's "message" should be the sub-part of the user's message relevant to that agent.
+5. For confirmation/cancellation replies ("ok", "xác nhận", "hủy", "không"), return a single step with the same agent that was previously active.
+6. Use "condition" to gate steps that should only run under certain circumstances:
+   - null or omitted: always run (default)
+   - "previous_safe": only run if the previous step found NO high-risk fraud. Use this when a TRANSACTION depends on a FRAUD_REPORT check.
+   - "previous_success": only run if the previous step completed successfully (not error/skipped).
+
+Condition rules:
+- When user says "check if safe, then transfer" or "nếu không phải scam thì chuyển", set condition="previous_safe" on the TRANSACTION step.
+- When a step simply uses data from a previous step (e.g. balance check → transfer), use depends_on_previous=true with condition=null.
+- Do NOT use condition on the first step.
+
+Multi-turn context:
+- You receive recent conversation history as prior messages.
+- If the user's latest message is a short reply and there's an active conversation flow, return a single step continuing that flow.
+- Only detect multi-intent for NEW, compound requests.
+
+Output JSON:
+{
+  "steps": [
+    {
+      "agent": "FRAUD_REPORT",
+      "message": "sub-question for this agent",
+      "depends_on_previous": false,
+      "condition": null,
+      "reason": "why this step is needed"
+    },
+    {
+      "agent": "TRANSACTION",
+      "message": "sub-request for this agent",
+      "depends_on_previous": true,
+      "condition": "previous_safe",
+      "reason": "only transfer if account is safe"
+    }
+  ],
+  "confidence": 0.95
+}
+
+Examples:
+
+User: "Tháng trước tôi chuyển bao nhiêu cho Minh? Chuyển thêm 2 triệu nữa cho Minh"
+Output:
+{
+  "steps": [
+    {"agent": "DATA_QUERY", "message": "Tháng trước tôi chuyển bao nhiêu cho Minh?", "depends_on_previous": false, "condition": null, "reason": "User wants to know previous transfer amount"},
+    {"agent": "TRANSACTION", "message": "Chuyển 2 triệu cho Minh", "depends_on_previous": true, "condition": null, "reason": "Transfer depends on knowing who Minh is from previous query"}
+  ],
+  "confidence": 0.95
+}
+
+User: "Số dư tài khoản tôi còn bao nhiêu rồi chuyển 1 triệu cho 0123456789"
+Output:
+{
+  "steps": [
+    {"agent": "DATA_QUERY", "message": "Số dư tài khoản tôi còn bao nhiêu?", "depends_on_previous": false, "condition": null, "reason": "User wants balance check first"},
+    {"agent": "TRANSACTION", "message": "Chuyển 1 triệu cho 0123456789", "depends_on_previous": false, "condition": null, "reason": "Independent transfer request"}
+  ],
+  "confidence": 0.93
+}
+
+User: "Check xem tài khoản 90311860909 có phải scam không? Nếu không thì chuyển 2 triệu"
+Output:
+{
+  "steps": [
+    {"agent": "FRAUD_REPORT", "message": "Kiểm tra tài khoản 90311860909 có bị báo cáo lừa đảo không", "depends_on_previous": false, "condition": null, "reason": "User wants fraud check first"},
+    {"agent": "TRANSACTION", "message": "Chuyển 2 triệu cho tài khoản 90311860909", "depends_on_previous": true, "condition": "previous_safe", "reason": "Only transfer if account is safe"}
+  ],
+  "confidence": 0.95
+}
+
+User: "Kiểm tra tài khoản này có an toàn không rồi mới chuyển 5 triệu cho nó"
+Output:
+{
+  "steps": [
+    {"agent": "FRAUD_REPORT", "message": "Kiểm tra tài khoản có an toàn không", "depends_on_previous": false, "condition": null, "reason": "Safety check requested before transfer"},
+    {"agent": "TRANSACTION", "message": "Chuyển 5 triệu cho tài khoản đó", "depends_on_previous": true, "condition": "previous_safe", "reason": "Conditional on fraud check being clean"}
+  ],
+  "confidence": 0.94
+}
+
+User: "Chuyển 5 triệu cho tài khoản 43275604177"
+Output:
+{
+  "steps": [
+    {"agent": "TRANSACTION", "message": "Chuyển 5 triệu cho tài khoản 43275604177", "depends_on_previous": false, "condition": null, "reason": "Single transfer request"}
+  ],
+  "confidence": 0.98
+}
+
+User: "ok chuyển đi"
+Output:
+{
+  "steps": [
+    {"agent": "TRANSACTION", "message": "ok chuyển đi", "depends_on_previous": false, "condition": null, "reason": "Confirmation of previous transaction"}
+  ],
+  "confidence": 0.97
+}
+
+User: "Lãi suất tiết kiệm 12 tháng là bao nhiêu?"
+Output:
+{
+  "steps": [
+    {"agent": "QA", "message": "Lãi suất tiết kiệm 12 tháng là bao nhiêu?", "depends_on_previous": false, "condition": null, "reason": "Single QA question"}
+  ],
+  "confidence": 0.97
+}
+"""
+
+PIPELINE_USER_TEMPLATE = """User message: {message}"""

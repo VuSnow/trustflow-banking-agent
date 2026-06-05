@@ -95,12 +95,16 @@ class Text2SQLSubAgent:
                 parts.append("theo số lần giao dịch")
 
         else:
-            # Generic fallback
-            parts.append(f"Query for user {user_id}: {goal}")
-            if recipient_hint:
-                parts.append(f"recipient={recipient_hint}")
-            if period:
-                parts.append(f"period={period}")
+            # Free text or generic fallback — pass question directly
+            question = constraints.get("question")
+            if question:
+                parts.append(question)
+            else:
+                parts.append(f"Query for user {user_id}: {goal}")
+                if recipient_hint:
+                    parts.append(f"recipient={recipient_hint}")
+                if period:
+                    parts.append(f"period={period}")
 
         return " ".join(parts)
 
@@ -114,8 +118,9 @@ class Text2SQLSubAgent:
                 status="success",
                 result={
                     "rows": rows,
+                    "results": rows,
                     "sql": data.get("sql", ""),
-                    "row_count": data.get("row_count", 0),
+                    "row_count": data.get("row_count", len(rows)),
                 },
                 confidence=0.75,
             )
@@ -125,6 +130,7 @@ class Text2SQLSubAgent:
                 status="needs_clarification",
                 result={
                     "message": "\n".join(data.get("questions", ["Cần thêm thông tin."])),
+                    "questions": data.get("questions", []),
                 },
                 confidence=0.0,
             )

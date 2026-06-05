@@ -10,7 +10,7 @@ Important boundaries:
 - If a field is unknown, return null and include it in missing_fields when it is needed.
 
 Fields:
-- operation: REPORT_FRAUD or CHECK_FRAUD_STATUS.
+- operation: REPORT_FRAUD, CHECK_FRAUD_STATUS, or CHECK_ACCOUNT_RISK.
 - fraud_type: SCAM_TRANSFER, SHOPPING_SCAM, INVESTMENT_SCAM, LOAN_SCAM,
   IMPERSONATION_SCAM, PHISHING, UNAUTHORIZED_TRANSACTION, or OTHER.
 - reported_account_no: account number being reported.
@@ -29,10 +29,11 @@ reported_account_no, reported_bank_code, contact_channel, aftermath, reason_text
 transaction_ref is useful but optional.
 
 If the user asks about status of a previous fraud report, set operation to CHECK_FRAUD_STATUS.
+If the user asks whether an account is safe, trustworthy, or has been reported as fraud/scam, set operation to CHECK_ACCOUNT_RISK.
 
 Output schema:
 {
-  "operation": "REPORT_FRAUD | CHECK_FRAUD_STATUS",
+  "operation": "REPORT_FRAUD | CHECK_FRAUD_STATUS | CHECK_ACCOUNT_RISK",
   "fraud_type": "string or null",
   "reported_account_no": "string or null",
   "reported_bank_code": "string or null",
@@ -51,3 +52,15 @@ FRAUD_REPORT_USER_TEMPLATE = """User message: {message}
 Current collected fields, if any:
 {current_state}
 """
+
+FRAUD_RISK_CHECK_SYSTEM_PROMPT = (
+    "Bạn là trợ lý ngân hàng Việt Nam. Dựa trên dữ liệu kiểm tra tài khoản dưới đây, "
+    "hãy trả lời câu hỏi của khách hàng một cách tự nhiên, ngắn gọn, và hữu ích.\n\n"
+    "Quy tắc:\n"
+    "- Nếu tài khoản bị báo cáo ở mức HIGH/CRITICAL: cảnh báo mạnh, khuyên không nên giao dịch.\n"
+    "- Nếu tài khoản bị báo cáo ở mức MEDIUM/LOW: thông báo có rủi ro nhưng chưa kết luận.\n"
+    "- Nếu tài khoản chưa bị báo cáo: thông báo chưa có ghi nhận nhưng nhắc cẩn thận.\n"
+    "- Không tiết lộ risk_score hay chi tiết nội bộ.\n"
+    "- Luôn khuyên khách hàng cảnh giác và liên hệ ngân hàng nếu nghi ngờ.\n"
+    "- Trả lời bằng tiếng Việt, 2-4 câu."
+)

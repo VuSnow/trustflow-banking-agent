@@ -35,6 +35,10 @@ BANK_MAP = {
     "VIB": "VIB",
 }
 
+# The bank that owns this system (all customers/accounts are internal to this bank)
+CURRENT_BANK_CODE = "SHB"
+CURRENT_BANK_NAME = "SHB"
+
 CARRIER_MAP = {
     "09": "VIETTEL",
     "03": "VIETTEL",
@@ -147,6 +151,7 @@ fraud_reports = []
 reported_accounts_list = []
 reported_customers_list = []
 fraud_decisions_list = []
+external_bank_accounts = []
 
 # Lookup dicts
 cust_by_cif = {}
@@ -1893,6 +1898,117 @@ def generate_fraud_data():
 
 
 # ============================================================
+# EXTERNAL BANK ACCOUNTS (inter-bank simulation)
+# ============================================================
+
+def generate_external_bank_accounts():
+    """Generate external bank accounts to simulate inter-bank (Napas) directory.
+
+    These are accounts from banks OTHER than CURRENT_BANK_CODE.
+    Used by lookup_recipient_info tool to resolve account -> name + bank.
+    """
+    global external_bank_accounts
+    idx = 1
+
+    # All bank codes except our bank
+    external_banks = {k: v for k, v in BANK_MAP.items() if k != CURRENT_BANK_CODE}
+    ext_bank_codes = list(external_banks.keys())
+
+    # Generate 50 external accounts spread across banks
+    for i in range(50):
+        bank_code = ext_bank_codes[i % len(ext_bank_codes)]
+        bank_name = external_banks[bank_code]
+        acc_no = gen_account_no()
+        name = gen_vn_name()
+        phone = gen_phone()
+        id_number = f"0{random.randint(10, 99)}{random.randint(100000000, 999999999)}"
+
+        ext_acc = {
+            "id": idx,
+            "account_no": acc_no,
+            "account_holder_name": name,
+            "bank_code": bank_code,
+            "bank_name": bank_name,
+            "id_number": id_number,
+            "phone": phone,
+            "status": "ACTIVE" if random.random() < 0.95 else "CLOSED",
+            "created_at": random_timestamp(datetime(2020, 1, 1), datetime(2025, 12, 31)).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        external_bank_accounts.append(ext_acc)
+        idx += 1
+
+    # Ensure some accounts match counterparties from BANK_TRANSFER transactions
+    # This makes the data realistic: transfers go to accounts that exist in the external directory
+    out_transfers = [t for t in transactions
+                     if t.get("transaction_type") == "BANK_TRANSFER"
+                     and t.get("direction") == "OUT"
+                     and t.get("counterparty_account_no")
+                     and t.get("counterparty_bank_code")
+                     and t.get("counterparty_bank_code") != CURRENT_BANK_CODE]
+
+    # Pick up to 30 unique counterparties to add
+    seen = set()
+    added = 0
+    for t in out_transfers:
+        key = (t["counterparty_account_no"], t["counterparty_bank_code"])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Skip if bank_code is our own bank
+        if t["counterparty_bank_code"] == CURRENT_BANK_CODE:
+            continue
+
+        bank_code = t["counterparty_bank_code"]
+        bank_name = BANK_MAP.get(bank_code, bank_code)
+
+        ext_acc = {
+            "id": idx,
+            "account_no": t["counterparty_account_no"],
+            "account_holder_name": t["counterparty_name"],
+            "bank_code": bank_code,
+            "bank_name": bank_name,
+            "id_number": f"0{random.randint(10, 99)}{random.randint(100000000, 999999999)}",
+            "phone": gen_phone(),
+            "status": "ACTIVE",
+            "created_at": random_timestamp(datetime(2020, 1, 1), datetime(2025, 12, 31)).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        external_bank_accounts.append(ext_acc)
+        idx += 1
+        added += 1
+        if added >= 30:
+            break
+
+    # Also ensure beneficiary accounts are in external directory
+    # Pick 20 random beneficiaries and add them
+    bene_sample = random.sample(beneficiaries, min(20, len(beneficiaries)))
+    for bene in bene_sample:
+        if bene["beneficiary_bank_code"] == CURRENT_BANK_CODE:
+            continue
+        key = (bene["beneficiary_account_no"], bene["beneficiary_bank_code"])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        bank_code = bene["beneficiary_bank_code"]
+        bank_name = BANK_MAP.get(bank_code, bank_code)
+
+        ext_acc = {
+            "id": idx,
+            "account_no": bene["beneficiary_account_no"],
+            "account_holder_name": bene["beneficiary_name"],
+            "bank_code": bank_code,
+            "bank_name": bank_name,
+            "id_number": f"0{random.randint(10, 99)}{random.randint(100000000, 999999999)}",
+            "phone": gen_phone(),
+            "status": "ACTIVE",
+            "created_at": random_timestamp(datetime(2020, 1, 1), datetime(2025, 6, 30)).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        external_bank_accounts.append(ext_acc)
+        idx += 1
+
+
+# ============================================================
 # VALIDATION
 # ============================================================
 
@@ -2306,6 +2422,8 @@ def main():
     generate_audit_logs()
     print("  fraud_data...")
     generate_fraud_data()
+    print("  external_bank_accounts...")
+    generate_external_bank_accounts()
 
     # Write CSVs
     print("\nWriting CSV files...")
@@ -2365,6 +2483,10 @@ def main():
               ["decision_id", "action_id", "receiver_account_no", "receiver_bank_code",
                "matched_report_count", "risk_score", "risk_level", "decision", "reason_codes", "created_at"])
 
+    write_csv("external_bank_accounts.csv", external_bank_accounts,
+              ["id", "account_no", "account_holder_name", "bank_code", "bank_name",
+               "id_number", "phone", "status", "created_at"])
+
     # Generate README
     print("  README.md...")
     generate_readme()
@@ -2392,6 +2514,7 @@ def main():
     print(f"  reported_accounts:       {len(reported_accounts_list):>6}")
     print(f"  reported_customers:      {len(reported_customers_list):>6}")
     print(f"  fraud_decisions:         {len(fraud_decisions_list):>6}")
+    print(f"  external_bank_accounts:  {len(external_bank_accounts):>6}")
     print(f"\nOutput: {OUTPUT_DIR.resolve()}")
 
 

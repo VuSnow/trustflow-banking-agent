@@ -29,6 +29,7 @@ DATA_DIR = BASE_DIR / "csv"
 
 SCHEMA = """
 -- Drop tables in reverse dependency order
+DROP TABLE IF EXISTS external_bank_accounts CASCADE;
 DROP TABLE IF EXISTS fraud_decisions CASCADE;
 DROP TABLE IF EXISTS reported_customers CASCADE;
 DROP TABLE IF EXISTS reported_accounts CASCADE;
@@ -258,6 +259,19 @@ CREATE TABLE fraud_decisions (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
+CREATE TABLE external_bank_accounts (
+    id SERIAL PRIMARY KEY,
+    account_no VARCHAR(20) NOT NULL,
+    account_holder_name VARCHAR(100) NOT NULL,
+    bank_code VARCHAR(10) NOT NULL,
+    bank_name VARCHAR(50) NOT NULL,
+    id_number VARCHAR(20),
+    phone VARCHAR(15),
+    status VARCHAR(10) DEFAULT 'ACTIVE',
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_bank_acc_unique ON external_bank_accounts(account_no, bank_code);
+
 -- Indexes
 CREATE INDEX idx_accounts_cif ON accounts(cif_no);
 CREATE INDEX idx_cards_cif ON cards(cif_no);
@@ -295,6 +309,7 @@ TABLES = [
     "reported_accounts",
     "reported_customers",
     "fraud_decisions",
+    "external_bank_accounts",
 ]
 
 # Boolean fields

@@ -13,7 +13,7 @@ from backend.agents.sub_agents.finance_advisor import (
     SavingsOpportunityAgent,
     SubscriptionTrackerAgent,
 )
-from backend.models import AgentTask, AgentTaskResult, DomainAgentOutput
+from backend.models import AgentTask, DomainAgentOutput
 from backend.prompts.finance_advice import FINANCE_CHAT_SYSTEM_PROMPT
 from backend.services.finance_advisor import (
     FinanceReportWriter,
@@ -39,7 +39,7 @@ class FinanceAdvisorAgent:
         self.transaction_store = FinanceTransactionStore()
         self.report_writer = FinanceReportWriter()
 
-    async def run(self, message: str, user_id: str, session_id: str) -> DomainAgentOutput:
+    async def run(self, message: str, user_id: str, session_id: str, history: list[dict] | None = None, pipeline_context: dict | None = None) -> DomainAgentOutput:
         trace: list[str] = []
         lookback_days = parse_lookback_days(message, default_days=30)
         logger.info(
