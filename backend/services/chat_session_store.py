@@ -330,6 +330,52 @@ class ChatSessionStore:
         """Clear card operation state."""
         self.set_card_operation_state(session_id, None)
 
+    # ─── Account operation state persistence ─────────────────────────────────
+
+    def get_account_operation_state(self, session_id: str) -> dict | None:
+        """Retrieve active account operation state for a session."""
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT account_operation_state FROM chat_sessions WHERE session_id = %s",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                if row and row["account_operation_state"]:
+                    state = row["account_operation_state"]
+                    if isinstance(state, str):
+                        return json.loads(state)
+                    return state
+            return None
+        finally:
+            conn.close()
+
+    def set_account_operation_state(self, session_id: str, state: dict | None) -> None:
+        """Store or clear account operation state for a session."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE chat_sessions
+                    SET account_operation_state = %s, updated_at = %s
+                    WHERE session_id = %s
+                    """,
+                    (
+                        json.dumps(state, ensure_ascii=False) if state else None,
+                        self._now(),
+                        session_id,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def clear_account_operation_state(self, session_id: str) -> None:
+        """Clear account operation state."""
+        self.set_account_operation_state(session_id, None)
+
     def _connect(self):
         return psycopg2.connect(self.dsn)
 

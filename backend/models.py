@@ -318,3 +318,50 @@ class CardOperationState(BaseModel):
     max_otp_attempts: int = 3
     otp_created_at: str | None = None
     otp_expires_seconds: int = 300
+
+
+# ─── Account Operation models ────────────────────────────────────────────────
+
+
+class AccountActionDraft(BaseModel):
+    """Typed draft for account operation."""
+    action_type: Literal["ACCOUNT_OPERATION"] = "ACCOUNT_OPERATION"
+    operation: Literal["OPEN_ACCOUNT", "CLOSE_ACCOUNT", "UPDATE_NICKNAME"]
+    # Target account (for CLOSE/UPDATE)
+    account_id: str | None = None
+    account_no: str | None = None
+    # For OPEN_ACCOUNT
+    product_code: str | None = None
+    product_name: str | None = None
+    account_type: str | None = None
+    currency: str | None = None
+    purpose: str | None = None
+    nickname: str | None = None
+    monthly_fee: int | None = None
+    opening_fee: int | None = None
+    # For UPDATE_NICKNAME
+    new_nickname: str | None = None
+    old_nickname: str | None = None
+    # Shared
+    reason: str | None = None
+
+
+class AccountOperationState(BaseModel):
+    """Persistent state for account operation workflow."""
+    session_id: str
+    user_id: str
+    fsm_state: Literal[
+        "WAITING_CONFIRMATION",
+        "WAITING_OTP",
+        "COMPLETED",
+        "CANCELLED",
+    ] = "WAITING_CONFIRMATION"
+
+    draft: dict = Field(default_factory=dict)
+    requires_otp: bool = False
+
+    # OTP tracking
+    otp_attempts: int = 0
+    max_otp_attempts: int = 3
+    otp_created_at: str | None = None
+    otp_expires_seconds: int = 300
