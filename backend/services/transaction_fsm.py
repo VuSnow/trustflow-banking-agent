@@ -202,7 +202,7 @@ def _handle_waiting_otp(
         elapsed = (datetime.now() - created_dt).total_seconds()
         if elapsed > otp_expires:
             tx_state["fsm_state"] = "BLOCKED"
-            set_transaction_state(session_id, tx_state)
+            clear_transaction_state(session_id)
             clear_pipeline_state(session_id)
 
             write_audit_log(
@@ -242,21 +242,22 @@ def _handle_waiting_otp(
     if validate_otp(message):
         return _otp_success(
             tx_state, saved_draft_data, user_id, session_id,
-            set_transaction_state=set_transaction_state,
+            clear_transaction_state=clear_transaction_state,
             clear_pipeline_state=clear_pipeline_state,
         )
 
     return _otp_failure(
         tx_state, saved_draft_data, user_id, session_id,
         set_transaction_state=set_transaction_state,
+        clear_transaction_state=clear_transaction_state,
         clear_pipeline_state=clear_pipeline_state,
     )
 
 
-def _otp_success(tx_state, saved_draft_data, user_id, session_id, *, set_transaction_state, clear_pipeline_state):
+def _otp_success(tx_state, saved_draft_data, user_id, session_id, *, clear_transaction_state, clear_pipeline_state):
     """Handle valid OTP."""
     tx_state["fsm_state"] = "OTP_VERIFIED"
-    set_transaction_state(session_id, tx_state)
+    clear_transaction_state(session_id)
     clear_pipeline_state(session_id)
     draft = ActionDraft(**saved_draft_data)
 
@@ -285,7 +286,7 @@ def _otp_success(tx_state, saved_draft_data, user_id, session_id, *, set_transac
     )
 
 
-def _otp_failure(tx_state, saved_draft_data, user_id, session_id, *, set_transaction_state, clear_pipeline_state):
+def _otp_failure(tx_state, saved_draft_data, user_id, session_id, *, set_transaction_state, clear_transaction_state, clear_pipeline_state):
     """Handle invalid OTP with attempt tracking."""
     tx_state["otp_attempts"] = tx_state.get("otp_attempts", 0) + 1
     remaining = tx_state.get("max_otp_attempts", 3) - tx_state["otp_attempts"]
@@ -303,7 +304,7 @@ def _otp_failure(tx_state, saved_draft_data, user_id, session_id, *, set_transac
 
     if remaining <= 0:
         tx_state["fsm_state"] = "BLOCKED"
-        set_transaction_state(session_id, tx_state)
+        clear_transaction_state(session_id)
         clear_pipeline_state(session_id)
 
         write_audit_log(

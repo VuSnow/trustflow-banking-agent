@@ -11,6 +11,7 @@ from backend.agents.data_query import DataQueryAgent
 from backend.agents.finance_advisor import FinanceAdvisorAgent
 from backend.agents.fraud_report import FraudReportAgent
 from backend.agents.transaction import TransactionAgent
+from backend.agents.card_operation import CardOperationAgent
 from backend.services.chat_session_store import ChatSessionStore
 from backend.routes import router as sessions_router, init as init_sessions
 from backend.routes.chat import router as chat_router, init as init_chat
@@ -42,6 +43,7 @@ DOMAIN_AGENT_MAP = {
     "DATA_QUERY": DataQueryAgent(),
     "FINANCE_ADVICE": FinanceAdvisorAgent(),
     "FRAUD_REPORT": FraudReportAgent(),
+    "CARD_OPERATION": CardOperationAgent(),
 }
 
 # ─── Initialize route modules ────────────────────────────────────────────────

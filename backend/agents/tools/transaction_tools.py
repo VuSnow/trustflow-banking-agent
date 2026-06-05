@@ -334,6 +334,38 @@ TRANSACTION_TOOLS = [
             "required": ["account_no"],
         },
     },
+    {
+        "name": "resolve_biller_account",
+        "description": (
+            "Resolve a biller account for bill payment. "
+            "Finds the user's registered biller accounts and unpaid bills. "
+            "Use when user wants to pay a bill (electricity, water, internet, phone). "
+            "Returns biller info, customer_bill_code, and unpaid bill details if available. "
+            "Do NOT use text2sql_query for biller resolution — use this tool instead."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "biller_type": {
+                    "type": "string",
+                    "description": (
+                        "Type of service: ELECTRICITY, WATER, INTERNET, PHONE_POSTPAID. "
+                        "Map from user language: 'tiền điện'→ELECTRICITY, 'tiền nước'→WATER, "
+                        "'internet/wifi'→INTERNET, 'cước điện thoại'→PHONE_POSTPAID."
+                    ),
+                },
+                "alias": {
+                    "type": "string",
+                    "description": "User's alias/nickname for the biller account (e.g. 'Nhà Hà Nội', 'Internet nhà').",
+                },
+                "biller_name": {
+                    "type": "string",
+                    "description": "Biller provider name if user mentions it (e.g. 'EVN', 'FPT', 'VNPT').",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 # Function dispatch map
@@ -341,4 +373,131 @@ TOOL_FUNCTIONS: dict[str, Callable[[dict, dict], Awaitable[dict]]] = {
     "text2sql_query": text2sql_query,
     "verify_recipient": verify_recipient,
     "check_fraud_risk": check_fraud_risk,
+    "resolve_biller_account": None,  # set below after function definition
 }
+
+
+# ============================================================
+# BILL PAYMENT TOOL
+# ============================================================
+
+
+async def resolve_biller_account(params: dict, context: dict) -> dict:
+    """Resolve user's biller account + unpaid bills deterministically.
+
+    Queries:
+    1. customer_biller_accounts JOIN billers → find registered billers
+    2. bills → find unpaid bills for matched customer_bill_code
+
+    Returns matched accounts with bill details.
+    """
+    user_id = context.get("user_id", "")
+    biller_type = params.get("biller_type", "").upper() if params.get("biller_type") else None
+    alias = params.get("alias", "").strip() if params.get("alias") else None
+    biller_name = params.get("biller_name", "").strip() if params.get("biller_name") else None
+
+    if not user_id:
+        return {"status": "failed", "message": "user_id is required in context."}
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn.cursor() as cur:
+                # Step 1: Find registered biller accounts
+                query = """
+                    SELECT
+                        cba.customer_bill_code,
+                        cba.alias,
+                        cba.status AS account_status,
+                        b.biller_code,
+                        b.biller_name,
+                        b.biller_type,
+                        b.provider,
+                        b.status AS biller_status
+                    FROM customer_biller_accounts cba
+                    JOIN billers b ON cba.biller_id = b.biller_id
+                    WHERE cba.cif_no = %s
+                      AND cba.status = 'ACTIVE'
+                      AND b.status = 'ACTIVE'
+                """
+                query_params: list = [user_id]
+
+                if biller_type:
+                    query += " AND b.biller_type = %s"
+                    query_params.append(biller_type)
+
+                if biller_name:
+                    query += " AND (b.biller_name ILIKE %s OR b.provider ILIKE %s)"
+                    query_params.extend([f"%{biller_name}%", f"%{biller_name}%"])
+
+                if alias:
+                    query += " AND cba.alias ILIKE %s"
+                    query_params.append(f"%{alias}%")
+
+                query += " ORDER BY b.biller_type, cba.alias"
+                cur.execute(query, query_params)
+                rows = cur.fetchall()
+
+                if not rows:
+                    return {
+                        "status": "not_found",
+                        "message": (
+                            f"Không tìm thấy dịch vụ thanh toán"
+                            f"{' loại ' + biller_type if biller_type else ''}"
+                            f" nào được đăng ký cho tài khoản của bạn."
+                        ),
+                        "accounts": [],
+                    }
+
+                # Step 2: For each matched account, query unpaid bills
+                accounts = []
+                for row in rows:
+                    customer_bill_code = row[0]
+                    biller_code = row[3]
+
+                    cur.execute(
+                        """
+                        SELECT bill_id, bill_period, amount_due, due_date, status
+                        FROM bills
+                        WHERE biller_code = %s
+                          AND customer_bill_code = %s
+                          AND status = 'UNPAID'
+                        ORDER BY due_date ASC
+                        """,
+                        (biller_code, customer_bill_code),
+                    )
+                    unpaid_bills = [
+                        {
+                            "bill_id": str(b[0]),
+                            "bill_period": b[1],
+                            "amount_due": float(b[2]),
+                            "due_date": str(b[3]) if b[3] else None,
+                        }
+                        for b in cur.fetchall()
+                    ]
+
+                    accounts.append({
+                        "customer_bill_code": customer_bill_code,
+                        "alias": row[1],
+                        "biller_code": biller_code,
+                        "biller_name": row[4],
+                        "biller_type": row[5],
+                        "provider": row[6],
+                        "unpaid_bills": unpaid_bills,
+                        "total_unpaid": sum(b["amount_due"] for b in unpaid_bills),
+                    })
+
+                return {
+                    "status": "success",
+                    "accounts": accounts,
+                    "account_count": len(accounts),
+                }
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"[TX TOOL] resolve_biller_account error: {e}")
+        return {"status": "failed", "message": f"Database error: {e}"}
+
+
+# Wire up the function
+TOOL_FUNCTIONS["resolve_biller_account"] = resolve_biller_account

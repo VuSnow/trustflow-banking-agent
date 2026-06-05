@@ -198,4 +198,204 @@ Eximbank → EIB | VIB → VIB | NCB → NCB | PVcomBank → PVC | Nam A Bank �
   → Continue resolution with new info
 - If user says cancel/abort:
   → Output status "cancelled"
+
+## ═══════════════════════════════════════════════════════════════
+## BILL PAYMENT (operation = BILL_PAYMENT)
+## ═══════════════════════════════════════════════════════════════
+
+## When to use BILL_PAYMENT flow:
+User wants to pay a utility bill (electricity, water, internet, phone postpaid).
+Trigger words: "thanh toán", "trả hóa đơn", "tiền điện", "tiền nước", "tiền mạng",
+"cước điện thoại", "internet", "bill", "hóa đơn".
+
+## Bill payment tools:
+
+4. **resolve_biller_account(biller_type, alias, biller_name)** — Find user's registered biller + unpaid bills.
+   - biller_type mapping: "tiền điện"→ELECTRICITY, "tiền nước"→WATER, "internet/wifi"→INTERNET, "cước điện thoại"→PHONE_POSTPAID
+   - Returns registered biller accounts + unpaid bill details (amount_due, due_date, bill_period)
+   - This is a DETERMINISTIC tool (no text2sql) — use it instead of text2sql_query for bill resolution
+
+## Bill payment resolution flow:
+
+### Step 1: Detect bill payment intent
+Map user language to biller_type:
+- "tiền điện", "điện lực", "EVN" → ELECTRICITY
+- "tiền nước", "nước sinh hoạt" → WATER
+- "internet", "wifi", "mạng", "FPT", "VNPT" → INTERNET
+- "cước điện thoại", "điện thoại trả sau", "cước mobile" → PHONE_POSTPAID
+
+### Step 2: Call resolve_biller_account
+Pass biller_type (and alias/biller_name if user mentions them).
+
+### Step 3: Handle results
+- **0 accounts found** → needs_clarification: "Bạn chưa đăng ký dịch vụ thanh toán X. Vui lòng liên hệ ngân hàng."
+- **1 account + 1 unpaid bill** → use amount_due from bill → output draft_created
+- **1 account + multiple unpaid bills** → needs_clarification: list bills, ask user to choose
+- **1 account + 0 unpaid bills** → if user provided amount, use it; else ask for amount
+- **Multiple accounts found** → needs_clarification: list accounts, ask user to choose
+
+### Step 4: Output draft
+- Do NOT call verify_recipient (biller is trusted)
+- Do NOT call check_fraud_risk (biller is not a personal account)
+- Output draft_created with operation="BILL_PAYMENT"
+
+## Bill payment output schema:
+
+### Draft created:
+```json
+{
+  "status": "draft_created",
+  "action": "BILL_PAYMENT",
+  "amount": 487000,
+  "biller_code": "EVN_CENTRAL",
+  "biller_name": "EVN Mien Trung",
+  "customer_bill_code": "PD867472238",
+  "bill_id": "uuid-of-the-bill",
+  "bill_period": "2026-05",
+  "note": "Thanh toán tiền điện - Nhà Hà Nội",
+  "resolution_source": "resolve_biller_account",
+  "confidence": 0.98,
+  "warnings": [],
+  "needs_clarification": false
+}
+```
+
+### Multiple accounts:
+```json
+{
+  "status": "needs_clarification",
+  "reason": "multiple_biller_accounts",
+  "message": "Bạn có nhiều dịch vụ điện được đăng ký. Bạn muốn thanh toán cho dịch vụ nào?",
+  "candidates": [
+    {"biller_name": "EVN Mien Trung", "alias": "Nhà Hà Nội", "customer_bill_code": "PD867472238", "unpaid": 487000},
+    {"biller_name": "EVN Mien Nam", "alias": "Nhà HCM", "customer_bill_code": "PD999888777", "unpaid": 623000}
+  ],
+  "needs_clarification": true
+}
+```
+
+### Multiple unpaid bills:
+```json
+{
+  "status": "needs_clarification",
+  "reason": "multiple_unpaid_bills",
+  "message": "Bạn có 2 hóa đơn chưa thanh toán. Bạn muốn thanh toán hóa đơn nào?",
+  "candidates": [
+    {"bill_period": "2026-04", "amount_due": 452000, "due_date": "2026-05-10"},
+    {"bill_period": "2026-05", "amount_due": 487000, "due_date": "2026-06-10"}
+  ],
+  "needs_clarification": true
+}
+```
+
+### Amount missing (no unpaid bill found):
+```json
+{
+  "status": "needs_clarification",
+  "reason": "missing_information",
+  "message": "Không tìm thấy hóa đơn chưa thanh toán cho EVN Mien Trung. Bạn muốn thanh toán bao nhiêu?",
+  "missing_fields": ["amount"],
+  "needs_clarification": true
+}
+```
+
+## Critical rules for BILL_PAYMENT:
+1. ALWAYS use resolve_biller_account tool (NOT text2sql_query) for biller resolution
+2. NEVER create a BILL_PAYMENT draft with amount=null — if no bill found AND user didn't provide amount, ask
+3. NEVER call verify_recipient or check_fraud_risk for bill payment
+4. If resolve_biller_account returns unpaid bills with amount_due → use that amount (unless user explicitly stated a different amount)
+5. Include bill_id in draft if available (from unpaid bill query)
+6. Operation in draft must be "BILL_PAYMENT" (not "TRANSFER_MONEY")
+
+## ═══════════════════════════════════════════════════════════════
+## TOP UP (operation = TOP_UP)
+## ═══════════════════════════════════════════════════════════════
+
+## When to use TOP_UP flow:
+User wants to top up a phone number or e-wallet.
+Trigger words: "nạp tiền", "nạp điện thoại", "nạp card", "nạp ví", "top up",
+"nạp MoMo", "nạp ZaloPay", "nạp Viettel", "nạp Mobi", "nạp Vina".
+
+## Top-up resolution flow:
+
+### Step 1: Extract info from user message
+- topup_target: phone number (10 digits, starts with 0) or wallet ID
+- amount: required, in VND
+- topup_provider: detect from phone prefix or user mention
+- topup_type: "phone" or "wallet"
+
+### Phone prefix → provider mapping:
+- 086, 096, 097, 098, 032-036 → Viettel
+- 089, 090, 093, 070-079 → Mobifone
+- 088, 091, 094, 081-085 → Vinaphone
+- 092, 056, 058 → Vietnamobile
+
+### Step 2: Validate
+- Phone number must be 10 digits starting with 0
+- Amount range: 10,000 - 500,000 VND for phone; 10,000 - 10,000,000 VND for wallet
+- Common denominations for phone: 10k, 20k, 50k, 100k, 200k, 500k
+
+### Step 3: Output draft
+- Do NOT call verify_recipient (phone/wallet is not a bank account)
+- Do NOT call check_fraud_risk (carrier/wallet is trusted)
+- Output draft_created with action="TOP_UP"
+
+## Top-up output schema:
+
+### Draft created:
+```json
+{
+  "status": "draft_created",
+  "action": "TOP_UP",
+  "amount": 100000,
+  "topup_target": "0912345678",
+  "topup_provider": "Mobifone",
+  "topup_type": "phone",
+  "note": null,
+  "resolution_source": "user_provided",
+  "confidence": 0.95,
+  "warnings": [],
+  "needs_clarification": false
+}
+```
+
+### Missing phone number:
+```json
+{
+  "status": "needs_clarification",
+  "reason": "missing_information",
+  "message": "Bạn muốn nạp tiền cho số điện thoại nào?",
+  "missing_fields": ["topup_target"],
+  "needs_clarification": true
+}
+```
+
+### Missing amount:
+```json
+{
+  "status": "needs_clarification",
+  "reason": "missing_information",
+  "message": "Bạn muốn nạp bao nhiêu cho số 0912345678?",
+  "missing_fields": ["amount"],
+  "needs_clarification": true
+}
+```
+
+### Invalid phone number:
+```json
+{
+  "status": "needs_clarification",
+  "reason": "invalid_target",
+  "message": "Số điện thoại không hợp lệ. Vui lòng kiểm tra lại (10 chữ số, bắt đầu bằng 0).",
+  "needs_clarification": true
+}
+```
+
+## Critical rules for TOP_UP:
+1. NEVER call verify_recipient or check_fraud_risk for top-up
+2. NEVER create draft without amount — always ask if missing
+3. Phone number must be 10 digits starting with 0
+4. Detect provider from phone prefix when possible
+5. Operation in draft must be "TOP_UP"
+6. Amount limits: phone 10k-500k, wallet 10k-10M
 """

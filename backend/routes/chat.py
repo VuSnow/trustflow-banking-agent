@@ -14,6 +14,7 @@ from backend.agents.orchestrator import orchestrator
 from backend.services.audit_log import write_audit_log
 from backend.services.chat_session_store import ChatSessionStore
 from backend.services.transaction_fsm import handle_transaction_state_intercept
+from backend.services.card_operation_fsm import handle_card_operation_state_intercept
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +58,21 @@ async def chat_endpoint(request: ChatRequest):
     if intercepted:
         response = intercepted
     else:
-        pipeline_state_dict = chat_session_store.get_pipeline_state(request.session_id)
-        if pipeline_state_dict:
-            response = await _resume_pipeline(pipeline_state_dict, request, history)
+        # ─── Deterministic intercept: card operation state ────────────
+        card_intercepted = await handle_card_operation_state_intercept(
+            request,
+            get_card_operation_state=chat_session_store.get_card_operation_state,
+            set_card_operation_state=chat_session_store.set_card_operation_state,
+            clear_card_operation_state=chat_session_store.clear_card_operation_state,
+        )
+        if card_intercepted:
+            response = card_intercepted
         else:
-            response = await _start_new_pipeline(request, history)
+            pipeline_state_dict = chat_session_store.get_pipeline_state(request.session_id)
+            if pipeline_state_dict:
+                response = await _resume_pipeline(pipeline_state_dict, request, history)
+            else:
+                response = await _start_new_pipeline(request, history)
 
     chat_session_store.add_message(
         session_id=request.session_id,

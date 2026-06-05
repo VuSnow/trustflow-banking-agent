@@ -25,7 +25,7 @@ from backend.models import (
 )
 from backend.agents.tools.transaction_tools import TRANSACTION_TOOLS, TOOL_FUNCTIONS
 from backend.prompts.transaction import TRANSACTION_AGENT_SYSTEM_PROMPT
-from backend.services.guardrails import check_transaction_guardrails
+from backend.services.guardrails import check_transaction_guardrails, check_bill_payment_guardrails, check_topup_guardrails
 from backend.services.chat_session_store import ChatSessionStore
 from backend.services.audit_log import write_audit_log
 
@@ -202,16 +202,36 @@ class TransactionAgent:
 
         # ─── Draft created — apply guardrails ────────────────────────────
         if status == "draft_created":
+            action = data.get("action", "TRANSFER_MONEY")
             draft = self._build_draft(data)
             trace.append("build_draft")
 
-            # Guardrails
-            fraud_data = data.get("fraud_screening") or context.get("fraud_screening")
-            guardrail = check_transaction_guardrails(
-                amount=draft.amount,
-                fraud_screening=fraud_data,
-                otp_verified=False,
-            )
+            # Route guardrails by operation
+            if action == "BILL_PAYMENT":
+                guardrail = check_bill_payment_guardrails(
+                    amount=draft.amount,
+                    biller_code=draft.biller_code,
+                    customer_bill_code=draft.customer_bill_code,
+                    bill_status=data.get("bill_status"),
+                    user_id=user_id,
+                    otp_verified=False,
+                )
+                fraud_data = None
+            elif action == "TOP_UP":
+                guardrail = check_topup_guardrails(
+                    amount=draft.amount,
+                    topup_target=draft.topup_target,
+                    topup_type=draft.topup_type,
+                    otp_verified=False,
+                )
+                fraud_data = None
+            else:
+                fraud_data = data.get("fraud_screening") or context.get("fraud_screening")
+                guardrail = check_transaction_guardrails(
+                    amount=draft.amount,
+                    fraud_screening=fraud_data,
+                    otp_verified=False,
+                )
 
             # BLOCK: reject outright
             if guardrail.blocked:
@@ -296,6 +316,40 @@ class TransactionAgent:
 
     def _build_draft(self, data: dict) -> ActionDraft:
         """Build ActionDraft from agent output data."""
+        action = data.get("action", "TRANSFER_MONEY")
+
+        if action == "BILL_PAYMENT":
+            return ActionDraft(
+                action_type="TRANSACTION",
+                operation="BILL_PAYMENT",
+                amount=data.get("amount"),
+                currency=data.get("currency", "VND"),
+                biller_code=data.get("biller_code"),
+                biller_name=data.get("biller_name"),
+                customer_bill_code=data.get("customer_bill_code"),
+                bill_id=data.get("bill_id"),
+                bill_period=data.get("bill_period"),
+                note=data.get("note"),
+                resolution_source=data.get("resolution_source", "resolve_biller_account"),
+                confidence=data.get("confidence"),
+                warnings=data.get("warnings") or [],
+            )
+
+        if action == "TOP_UP":
+            return ActionDraft(
+                action_type="TRANSACTION",
+                operation="TOP_UP",
+                amount=data.get("amount"),
+                currency=data.get("currency", "VND"),
+                topup_target=data.get("topup_target"),
+                topup_provider=data.get("topup_provider"),
+                topup_type=data.get("topup_type", "phone"),
+                note=data.get("note"),
+                resolution_source=data.get("resolution_source", "user_provided"),
+                confidence=data.get("confidence"),
+                warnings=data.get("warnings") or [],
+            )
+
         return ActionDraft(
             action_type="TRANSACTION",
             operation="TRANSFER_MONEY",
@@ -314,6 +368,14 @@ class TransactionAgent:
 
     def _build_confirmation_message(self, draft: ActionDraft, warning: str | None) -> str:
         """Build a human-readable confirmation message from the frozen draft."""
+        if draft.operation == "BILL_PAYMENT":
+            return self._build_bill_confirmation(draft, warning)
+        if draft.operation == "TOP_UP":
+            return self._build_topup_confirmation(draft, warning)
+        return self._build_transfer_confirmation(draft, warning)
+
+    def _build_transfer_confirmation(self, draft: ActionDraft, warning: str | None) -> str:
+        """Confirmation message for TRANSFER_MONEY."""
         parts = ["Vui lòng xác nhận thông tin giao dịch:\n"]
         parts.append(f"• Người nhận: **{draft.recipient_name}**")
         parts.append(f"• Số tài khoản: **{draft.recipient_account}**")
@@ -340,6 +402,55 @@ class TransactionAgent:
             parts.append(f"\n{warning}")
 
         parts.append("\nBạn xác nhận chuyển tiền không?")
+        return "\n".join(parts)
+
+    def _build_bill_confirmation(self, draft: ActionDraft, warning: str | None) -> str:
+        """Confirmation message for BILL_PAYMENT."""
+        parts = ["Vui lòng xác nhận thanh toán hóa đơn:\n"]
+        parts.append(f"• Nhà cung cấp: **{draft.biller_name}**")
+        parts.append(f"• Mã khách hàng: **{draft.customer_bill_code}**")
+
+        if draft.bill_period:
+            parts.append(f"• Kỳ: **{draft.bill_period}**")
+
+        if draft.amount:
+            parts.append(f"• Số tiền: **{draft.amount:,} {draft.currency}**")
+
+        if draft.note:
+            parts.append(f"• Nội dung: {draft.note}")
+
+        if draft.warnings:
+            for w in draft.warnings:
+                parts.append(f"⚠️ {w}")
+
+        if warning:
+            parts.append(f"\n{warning}")
+
+        parts.append("\nBạn xác nhận thanh toán không?")
+        return "\n".join(parts)
+
+    def _build_topup_confirmation(self, draft: ActionDraft, warning: str | None) -> str:
+        """Confirmation message for TOP_UP."""
+        parts = ["Vui lòng xác nhận nạp tiền:\n"]
+        parts.append(f"• Số điện thoại/ví: **{draft.topup_target}**")
+
+        if draft.topup_provider:
+            parts.append(f"• Nhà mạng/ví: **{draft.topup_provider}**")
+
+        if draft.amount:
+            parts.append(f"• Số tiền: **{draft.amount:,} {draft.currency}**")
+
+        topup_label = "Nạp điện thoại" if draft.topup_type == "phone" else "Nạp ví"
+        parts.append(f"• Loại: {topup_label}")
+
+        if draft.warnings:
+            for w in draft.warnings:
+                parts.append(f"⚠️ {w}")
+
+        if warning:
+            parts.append(f"\n{warning}")
+
+        parts.append("\nBạn xác nhận nạp tiền không?")
         return "\n".join(parts)
 
     def _build_openai_tools(self) -> list[dict]:

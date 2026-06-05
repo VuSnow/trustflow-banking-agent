@@ -284,6 +284,52 @@ class ChatSessionStore:
         """Clear transaction state when transaction completes or is cancelled."""
         self.set_transaction_state(session_id, None)
 
+    # ─── Card operation state persistence ────────────────────────────────────
+
+    def get_card_operation_state(self, session_id: str) -> dict | None:
+        """Retrieve active card operation state for a session."""
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT card_operation_state FROM chat_sessions WHERE session_id = %s",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                if row and row["card_operation_state"]:
+                    state = row["card_operation_state"]
+                    if isinstance(state, str):
+                        return json.loads(state)
+                    return state
+            return None
+        finally:
+            conn.close()
+
+    def set_card_operation_state(self, session_id: str, state: dict | None) -> None:
+        """Store or clear card operation state for a session."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE chat_sessions
+                    SET card_operation_state = %s, updated_at = %s
+                    WHERE session_id = %s
+                    """,
+                    (
+                        json.dumps(state, ensure_ascii=False) if state else None,
+                        self._now(),
+                        session_id,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def clear_card_operation_state(self, session_id: str) -> None:
+        """Clear card operation state."""
+        self.set_card_operation_state(session_id, None)
+
     def _connect(self):
         return psycopg2.connect(self.dsn)
 

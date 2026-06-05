@@ -96,18 +96,32 @@ class ActionDraft(BaseModel):
     """Typed draft for Guardian input — never raw dict at boundaries.
     This is what gets stored as PendingAction.draft later."""
     action_type: str          # "TRANSACTION", "CARD_OPERATION", etc.
-    operation: str            # "TRANSFER_MONEY", "LOCK_CARD", etc.
+    operation: str            # "TRANSFER_MONEY", "BILL_PAYMENT", "LOCK_CARD", etc.
     amount: int | None = None
     currency: str = "VND"
+    note: str | None = None
+    resolution_source: str | None = None
+    confidence: float | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+    # ─── Transfer fields ──────────────────────────────────────────────────
     recipient_name: str | None = None
     recipient_account: str | None = None
     recipient_bank: str | None = None
     bank_name: str | None = None
     transfer_type: Literal["intrabank", "interbank"] | None = None
-    note: str | None = None
-    resolution_source: str | None = None
-    confidence: float | None = None
-    warnings: list[str] = Field(default_factory=list)
+
+    # ─── Bill payment fields ──────────────────────────────────────────────
+    biller_code: str | None = None
+    biller_name: str | None = None
+    customer_bill_code: str | None = None
+    bill_id: str | None = None
+    bill_period: str | None = None
+
+    # ─── Top-up fields ────────────────────────────────────────────────────
+    topup_target: str | None = None       # phone number or wallet ID
+    topup_provider: str | None = None     # Viettel, Mobifone, Vinaphone, MoMo, etc.
+    topup_type: Literal["phone", "wallet"] | None = None
 
 
 class FraudReportExtraction(BaseModel):
@@ -253,3 +267,54 @@ class TransactionState(BaseModel):
     max_otp_attempts: int = 3
     otp_created_at: str | None = None
     otp_expires_seconds: int = 300  # 5 minutes
+
+
+# ─── Card Operation models ────────────────────────────────────────────────────
+
+
+class CardActionDraft(BaseModel):
+    """Typed draft for card operation."""
+    action_type: Literal["CARD_OPERATION"] = "CARD_OPERATION"
+    operation: Literal[
+        "LOCK_CARD", "UNLOCK_CARD", "REPORT_LOST",
+        "ENABLE_ONLINE_PAYMENT", "DISABLE_ONLINE_PAYMENT",
+        "ENABLE_INTERNATIONAL_PAYMENT", "DISABLE_INTERNATIONAL_PAYMENT",
+        "CHANGE_LIMIT", "VIEW_CARD_INFO", "VIEW_CARD_TRANSACTIONS",
+    ]
+    card_id: str
+    masked_card_no: str
+    card_type: str | None = None
+    card_network: str | None = None
+    reason: str | None = None
+    # For CHANGE_LIMIT
+    limit_type: str | None = None    # daily_atm_limit, daily_online_limit, etc.
+    new_limit: int | None = None
+    old_limit: int | None = None
+    # For toggle controls
+    control_name: str | None = None
+    new_value: bool | None = None
+    old_value: bool | None = None
+
+
+class CardOperationState(BaseModel):
+    """Persistent state for card operation workflow (separate from transaction)."""
+    session_id: str
+    user_id: str
+    fsm_state: Literal[
+        "WAITING_CONFIRMATION",
+        "WAITING_OTP",
+        "COMPLETED",
+        "CANCELLED",
+    ] = "WAITING_CONFIRMATION"
+
+    # Frozen draft
+    draft: dict = Field(default_factory=dict)
+
+    # Whether this operation requires OTP
+    requires_otp: bool = False
+
+    # OTP tracking
+    otp_attempts: int = 0
+    max_otp_attempts: int = 3
+    otp_created_at: str | None = None
+    otp_expires_seconds: int = 300
